@@ -12,7 +12,7 @@ spring:
   ai:
     deepseek:
       base-url: https://api.deepseek.com
-      api-key: sk-0fffa84412f84ed5b7aff348c1200b2e
+      api-key: ${DEEPSEEK_API_KEY}
       chat:
         options:
           model: deepseek-chat
