@@ -8,9 +8,9 @@ import lombok.NoArgsConstructor;
 import java.util.List;
 
 /**
- * @program: 企业级别深度设计 AI Agent。添加 阿星不是程序员 微信，添加时备注 super 来获取项目的完整资料 
+ * @program: 企业级别深度设计 AI Agent。添加  微信，添加时备注 super 来获取项目的完整资料
  * @description: 技术文章模型 —— 用于导入知识库时的输入对象
- * @author: 阿星不是程序员
+ *
  **/
 /**
  * 技术文章模型 —— 用于导入知识库时的输入对象。

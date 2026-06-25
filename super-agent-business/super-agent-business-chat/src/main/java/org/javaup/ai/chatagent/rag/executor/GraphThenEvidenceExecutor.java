@@ -20,11 +20,50 @@ import java.util.List;
 import java.util.Map;
 
 /**
+ * 结构图定位 + 证据取用执行器 - 调用链路第5层分支 E（GRAPH_THEN_EVIDENCE 模式）
+ * <p>
+ * <b>适用场景：</b>文档问答中，问题需要精确定位到文档结构图中的特定章节/编号项，
+ * 并且需要校验该位置确实有内容证据。例如：
+ * <ul>
+ *   <li>"第4.2节的第3项要求是什么？"（需定位到 4.2 节 → 第3项）</li>
+ *   <li>"安全规范中关于密码策略的哪一步提到了复杂度？"（需定位到安全规范 → 密码策略 → 找"复杂度"）</li>
+ * </ul>
+ * <p>
+ * <b>核心逻辑：两步走 + 证据校验</b>
+ * <pre>
+ * execute(taskInfo)
+ *   │
+ *   ├─ 1. 结构图定位
+ *   │   └─ buildGraphResult(plan, decision)
+ *   │       → structureGraphQueryEngine.buildGraphResult(
+ *   │           documentId, sectionNodeId, itemIndex, itemKeyword)
+ *   │       返回 GraphQueryResult {targetSection, targetItem, matchedItems, ...}
+ *   │
+ *   ├─ 2. 证据校验
+ *   │   └─ hasGraphEvidence(graphResult, decision)
+ *   │       检查目标章节/编号项是否有实际内容文本
+ *   │       ├─ NO  → 返回 noEvidenceReply 兜底
+ *   │       └─ YES → 继续渲染
+ *   │
+ *   └─ 3. 答案渲染
+ *       └─ graphAnswerRenderer.renderGraphAnswer(mode, decision, graphResult)
+ *          将结构化查询结果渲染为自然语言文本
+ * </pre>
+ * <p>
+ * <b>与 GraphOnlyExecutor 的区别：</b>
+ * <ul>
+ *   <li>GRAPH_ONLY：直接返回结构图信息（如章节列表），不校验内容证据</li>
+ *   <li>GRAPH_THEN_EVIDENCE：先定位具体位置，然后检查该位置是否有实际内容，
+ *       如果内容为空则认为证据不足，返回兜底回复</li>
+ * </ul>
+ * <p>
+ * <b>关键词提取（extractItemKeyword）：</b>
+ * 从问题中提取 "哪一步" / "哪一项" 后面的关键词，用于在章节内容中匹配具体的编号项。
+ *
  * @program: 企业级别深度设计 AI Agent。添加 阿星不是程序员 微信，添加时备注 super 来获取项目的完整资料
- * @description: 先走结构图定位，再读取章节/item 证据的执行器
+ * @description: 结构图定位+证据校验执行器 - 精确定位文档章节/编号项并校验证据
  * @author: 阿星不是程序员
  **/
-
 @Component
 @Slf4j
 public class GraphThenEvidenceExecutor implements ConversationExecutor {
@@ -43,9 +82,27 @@ public class GraphThenEvidenceExecutor implements ConversationExecutor {
 
     @Override
     public ExecutionMode mode() {
+        // 本执行器处理 GRAPH_THEN_EVIDENCE 模式（结构图定位 + 证据校验）
         return ExecutionMode.GRAPH_THEN_EVIDENCE;
     }
 
+    /**
+     * 执行结构图定位 + 证据校验 + 答案渲染
+     * <p>
+     * <b>前置条件：</b>需要有效的 structureNodeId，否则返回无证据兜底文本。
+     * <p>
+     * <b>证据校验逻辑（hasGraphEvidence）：</b>
+     * <ul>
+     *   <li>targetSection 为空 → 无证据</li>
+     *   <li>有 itemIndex 要求：
+     *       需要 targetItem 不为空，或有 matchedItems 列表非空</li>
+     *   <li>无 itemIndex 要求：
+     *       需要章节内容文本（contentText）不为空，或有 matchedItems 列表非空</li>
+     * </ul>
+     *
+     * @param taskInfo 运行时任务上下文
+     * @return 包含渲染答案或兜底文本的单元素 Flux
+     */
     @Override
     public Flux<String> execute(TaskInfo taskInfo) {
         ConversationExecutionPlan plan = taskInfo.executionPlan();

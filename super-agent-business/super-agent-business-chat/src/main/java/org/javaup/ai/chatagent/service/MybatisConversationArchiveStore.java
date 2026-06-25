@@ -64,52 +64,84 @@ public class MybatisConversationArchiveStore implements ConversationArchiveStore
         this.objectMapper = objectMapper;
     }
 
-    @Override
-    @Transactional(rollbackFor = Exception.class)
-    public ConversationExchangeView startExchange(String conversationId,
-                                                  String question,
-                                                  ChatQueryMode chatMode,
-                                                  Long selectedDocumentId,
-                                                  String selectedDocumentName) {
-        upsertDialogue(conversationId, ChatSessionStatus.RUNNING, chatMode, selectedDocumentId, selectedDocumentName);
+/**
+ * 开启新一轮对话（在数据库中创建 exchange 记录）
+ * <p>
+ * <b>这个方法做两件事（同一个事务）：</b>
+ * <ol>
+ *   <li><b>维护会话记录（dialogue）</b>：
+ *       如果 conversationId 不存在 → 新建一条 dialogue，状态 = RUNNING；
+ *       如果已存在 → 更新 chatMode / documentScope 如果有变化</li>
+ *   <li><b>创建本轮交换记录（exchange）</b>：
+ *       用雪花 ID 生成器产生全局唯一 exchangeId，插入一条 exchange，
+ *       状态 = RUNNING，answer/thinking/references 暂时全空。
+ *       这些字段在对话结束后由 {@link #completeExchange} 回填。</li>
+ * </ol>
+ * <p>
+ * <b>为什么 start + complete 要分两步？</b>
+ * 因为流式对话是异步的：start 时还不知道回答内容，
+ * 只能先占位一条 RUNNING 记录，等 LLM 生成完毕后 complete 再回来填坑。
+ * <p>
+ * <b>对话表（dialogue）vs 轮次表（exchange）的关系：</b>
+ * 1 个 dialogue（会话）= N 个 exchange（轮次）。
+ * 例如用户连续问了 3 个问题，就是 1 条 dialogue + 3 条 exchange。
+ *
+ * @param conversationId     会话ID
+ * @param question           用户问题
+ * @param chatMode           聊天模式（OPEN_CHAT / DOCUMENT / AUTO_DOCUMENT）
+ * @param selectedDocumentId 锁定的文档ID（DOCUMENT 模式下有值）
+ * @param selectedDocumentName 锁定的文档名称
+ * @return 本轮交换的视图对象（含 exchangeId，后续流程需要用它做追踪和收尾）
+ */
+@Override
+@Transactional(rollbackFor = Exception.class)
+public ConversationExchangeView startExchange(String conversationId,
+                                              String question,
+                                              ChatQueryMode chatMode,
+                                              Long selectedDocumentId,
+                                              String selectedDocumentName) {
+    // 第一步：维护 dialogue 表 —— 没有就创建，有就按需更新（chatMode/文档变化时）
+    upsertDialogue(conversationId, ChatSessionStatus.RUNNING, chatMode, selectedDocumentId, selectedDocumentName);
 
-        long exchangeId = uidGenerator.getUid();
+    // 第二步：用百度 UID 生成器产生全局唯一、趋势递增的 exchangeId（雪花算法）
+    long exchangeId = uidGenerator.getUid();
 
-        SuperAgentChatExchange exchange = new SuperAgentChatExchange();
+    // 第三步：插入一条"占位"exchange，answer/thinking/references 暂时全空
+    SuperAgentChatExchange exchange = new SuperAgentChatExchange();
+    exchange.setId(exchangeId);
+    exchange.setConversationId(conversationId);
+    exchange.setQuestion(question);
+    exchange.setAnswer("");                          // 还没生成，先空着
+    exchange.setThinkingSteps(writeJson(List.of()));  // JSON [] 占位
+    exchange.setReferenceList(writeJson(List.of()));  // JSON [] 占位
+    exchange.setRecommendationList(writeJson(List.of())); // JSON [] 占位
+    exchange.setUsedToolList(writeJson(List.of()));   // JSON [] 占位
+    exchange.setDebugTraceJson(null);                 // 调试信息稍后补
+    exchange.setTurnStatus(ChatTurnStatus.RUNNING.getCode()); // 标记为"进行中"
+    exchange.setErrorMessage("");                     // 无错误
+    exchange.setFirstResponseTimeMs(null);            // 首字延迟稍后补
+    exchange.setTotalResponseTimeMs(null);            // 总耗时稍后补
+    exchange.setStatus(BusinessStatus.YES.getCode()); // 1=正常
+    exchangeMapper.insert(exchange);
 
-        exchange.setId(exchangeId);
-        exchange.setConversationId(conversationId);
-        exchange.setQuestion(question);
-        exchange.setAnswer("");
-        exchange.setThinkingSteps(writeJson(List.of()));
-        exchange.setReferenceList(writeJson(List.of()));
-        exchange.setRecommendationList(writeJson(List.of()));
-        exchange.setUsedToolList(writeJson(List.of()));
-        exchange.setDebugTraceJson(null);
-        exchange.setTurnStatus(ChatTurnStatus.RUNNING.getCode());
-        exchange.setErrorMessage("");
-        exchange.setFirstResponseTimeMs(null);
-        exchange.setTotalResponseTimeMs(null);
-        exchange.setStatus(BusinessStatus.YES.getCode());
-        exchangeMapper.insert(exchange);
-
-        return new ConversationExchangeView(
-            exchangeId,
-            question,
-            "",
-            List.of(),
-            List.of(),
-            List.of(),
-            List.of(),
-            null,
-            ChatTurnStatus.RUNNING,
-            "",
-            null,
-            null,
-             DateUtils.now(),
-             DateUtils.now()
-        );
-    }
+    // 返回视图对象（给 BusinessChatService.createTaskInfo 用）
+    return new ConversationExchangeView(
+        exchangeId,
+        question,
+        "",                     // answer 还是空的
+        List.of(),              // thinkingSteps 空的
+        List.of(),              // references 空的
+        List.of(),              // recommendations 空的
+        List.of(),              // usedTools 空的
+        null,                   // debugTrace 稍后补
+        ChatTurnStatus.RUNNING,
+        "",
+        null,                   // 首字延迟
+        null,                   // 总耗时
+        DateUtils.now(),
+        DateUtils.now()
+    );
+}
 
     @Override
     @Transactional(rollbackFor = Exception.class)
@@ -356,11 +388,33 @@ public class MybatisConversationArchiveStore implements ConversationArchiveStore
         return new ConversationArchiveStore.ConversationRemovalResult(removedDialogueCount, removedExchangeCount);
     }
 
-    private void upsertDialogue(String conversationId,
-                                ChatSessionStatus dialogueStage,
-                                ChatQueryMode chatMode,
-                                Long selectedDocumentId,
-                                String selectedDocumentName) {
+/**
+ * 插入或更新对话会话记录（dialogue 表）
+ * <p>
+ * <b>逻辑：</b>
+ * <ol>
+ *   <li>按 conversationId 查一条现有的 dialogue（取最新一条）</li>
+ *   <li><b>不存在 → INSERT</b>：新建一条 dialogue，状态设为 RUNNING，
+ *       记录当前的 chatMode 和锁定的文档范围</li>
+ *   <li><b>存在 → 按需 UPDATE</b>：只有当状态、chatMode、或文档范围发生变化时才更新。
+ *       如果完全没变就不发 SQL，减少无意义的数据库写操作</li>
+ * </ol>
+ * <p>
+ * <b>为什么"没变就不更新"？</b>
+ * 每次 startExchange 都会调这个方法。如果用户在同一个会话里连续问多个问题，
+ * chatMode 和文档范围通常不变，没必要每次都 UPDATE 一遍 dialogue 表。
+ *
+ * @param conversationId     会话ID
+ * @param dialogueStage      目标会话状态（通常为 RUNNING）
+ * @param chatMode           聊天模式
+ * @param selectedDocumentId 锁定的文档ID
+ * @param selectedDocumentName 锁定的文档名称
+ */
+private void upsertDialogue(String conversationId,
+                            ChatSessionStatus dialogueStage,
+                            ChatQueryMode chatMode,
+                            Long selectedDocumentId,
+                            String selectedDocumentName) {
         Objects.requireNonNull(chatMode, "chatMode 不能为空");
         SuperAgentChatDialogue dialogue = dialogueMapper.selectOne(
             activeDialogueByConversation(conversationId)
@@ -369,10 +423,11 @@ public class MybatisConversationArchiveStore implements ConversationArchiveStore
         );
 
         if (dialogue == null) {
+            // 分支 A：这个 conversationId 是全新的 → 插入一条 dialogue
             SuperAgentChatDialogue newDialogue = new SuperAgentChatDialogue();
             newDialogue.setId(uidGenerator.getUid());
             newDialogue.setConversationId(conversationId);
-            newDialogue.setSessionStatus(dialogueStage.getCode());
+            newDialogue.setSessionStatus(dialogueStage.getCode());   // RUNNING
             newDialogue.setChatMode(chatMode.getCode());
             newDialogue.setSelectedDocumentId(selectedDocumentId);
             newDialogue.setSelectedDocumentName(selectedDocumentName);
@@ -382,12 +437,14 @@ public class MybatisConversationArchiveStore implements ConversationArchiveStore
             return;
         }
 
+        // 分支 B：dialogue 已存在 → 检查三个维度是否有变化
         boolean stageChanged = !dialogueStage.equals(ChatSessionStatus.fromCode(dialogue.getSessionStatus()));
         boolean chatModeChanged = !Objects.equals(chatMode.getCode(), dialogue.getChatMode());
         boolean documentScopeChanged = !Objects.equals(selectedDocumentId, dialogue.getSelectedDocumentId())
             || !Objects.equals(safeText(selectedDocumentName), safeText(dialogue.getSelectedDocumentName()));
 
         if (stageChanged || chatModeChanged || documentScopeChanged) {
+            // 有任一维度变化 → UPDATE
             SuperAgentChatDialogue updateDialogue = new SuperAgentChatDialogue();
             updateDialogue.setId(dialogue.getId());
             updateDialogue.setSessionStatus(dialogueStage.getCode());
@@ -396,6 +453,7 @@ public class MybatisConversationArchiveStore implements ConversationArchiveStore
             updateDialogue.setSelectedDocumentName(selectedDocumentName);
             dialogueMapper.updateById(updateDialogue);
         }
+        // 没变化 → 什么都不做，省一次 UPDATE
     }
 
     private ChatQueryMode resolveChatMode(SuperAgentChatDialogue dialogue) {

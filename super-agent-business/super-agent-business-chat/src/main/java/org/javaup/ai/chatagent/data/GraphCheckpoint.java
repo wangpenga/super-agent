@@ -10,27 +10,37 @@ import lombok.NoArgsConstructor;
 import java.time.LocalDateTime;
 
 /**
- * @program: 企业级别深度设计 AI Agent。添加 阿星不是程序员 微信，添加时备注 super 来获取项目的完整资料
- * @description: 数据实体
- * @author: 阿星不是程序员
- **/
-
+ * Graph Checkpoint 表 (GRAPH_CHECKPOINT)
+ * <p>
+ * Spring AI Alibaba Graph 框架的检查点存储表。用于持久化 Agent 执行图的状态快照，
+ * 支持对话中断后恢复。每个检查点记录当前节点 ID、下一个节点 ID 和序列化后的完整 Agent 状态。
+ * <p>
+ * 与 GRAPH_THREAD 表配合使用，实现对话状态的持久化和断点续传。
+ *
+ * @author 阿星不是程序员
+ */
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
 @TableName("GRAPH_CHECKPOINT")
 public class GraphCheckpoint {
 
+    /** Checkpoint ID，检查点唯一标识 */
     @TableId(value = "checkpoint_id", type = IdType.INPUT)
     private String checkpointId;
 
+    /** 关联线程 ID（对应 GraphThread.threadId） */
     private String threadId;
 
+    /** 当前节点 ID */
     private String nodeId;
 
+    /** 下一个节点 ID */
     private String nextNodeId;
 
+    /** 序列化后的 Agent 状态，JSON 格式 */
     private String stateData;
 
+    /** 保存时间 */
     private LocalDateTime savedAt;
 }

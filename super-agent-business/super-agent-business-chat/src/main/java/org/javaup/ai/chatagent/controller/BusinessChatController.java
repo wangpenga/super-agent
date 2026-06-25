@@ -28,9 +28,36 @@ import reactor.core.publisher.Flux;
 import java.util.List;
 
 /**
- * @program: 企业级别深度设计 AI Agent。添加 阿星不是程序员 微信，添加时备注 super 来获取项目的完整资料
- * @description: 控制层
- * @author: 阿星不是程序员
+ * 业务聊天控制器 - SSE 流式对话入口
+ * <p>
+ * <b>核心链路：</b>
+ * <pre>
+ * Controller.stream(dto)
+ *   → Service.openConversationStream
+ *       ├─ buildLaunchPlan     参数校验 + 规范化
+ *       ├─ claimConversationLease    Redis 租约防并发
+ *       └─ bootstrapConversation    DB 记录 + TaskInfo + Sink 绑定
+ *           └─ bindClientChannel → activateGeneration
+ *                ├─ startLeaseRenewal     定时续约
+ *                └─ buildConversationExecution
+ *                     ├─ prepareExecutionPlan    ChatPreparationOrchestrator
+ *                     │    ├─ summarizeHistory        装载会话记忆
+ *                     │    ├─ 按 chatMode 路由:
+ *                     │    │    OPEN_CHAT     → REACT_AGENT (ReactAgent LLM+工具)
+ *                     │    │    AUTO_DOCUMENT → 自动选文档或 CLARIFICATION
+ *                     │    │    DOCUMENT      → RAG 检索或结构图查询
+ *                     │    └─ 返回 ExecutionPlan
+ *                     ├─ executorRegistry.get(mode)    选执行器
+ *                     └─ executor.execute(taskInfo)    5 种执行器之一
+ *                          ├─ ReactAgentExecutor      LLM 自主推理
+ *                          ├─ RagChatExecutor         双通道检索+LLM生成
+ *                          ├─ ClarificationExecutor   直接返回澄清文本
+ *                          ├─ GraphOnlyExecutor        结构图直接回答
+ *                          └─ GraphThenEvidenceExecutor 结构图定位+校验
+ *   → emitModelChunk(每条文本推SSE) → finishSuccessfully/finishWithFailure/stopTask
+ * </pre>
+ *
+ * @author 阿星不是程序员
  **/
 @AllArgsConstructor
 @RestController
@@ -39,6 +66,25 @@ public class BusinessChatController {
 
     private final BusinessChatService businessChatService;
 
+    /**
+     * SSE 流式对话（POST /api/chat/stream）
+     * <p>
+     * 接收用户问题，通过 {@link Flux#defer} 延迟执行，返回 SSE 事件流。
+     * 每个元素是一条 JSON 格式的 SSE 事件（text/thinking/error/reference/recommend）。
+     * <p>
+     * <b>入参：</b>
+     * <ul>
+     *   <li>question（必填）：用户问题</li>
+     *   <li>conversationId（可选，不传自动生成 UUID）</li>
+     *   <li>chatMode（必填）：OPEN_CHAT / DOCUMENT / AUTO_DOCUMENT</li>
+     *   <li>selectedDocumentId（DOCUMENT 模式下必填）</li>
+     * </ul>
+     * <p>
+     * <b>链路：</b>openConversationStream → 租约加锁 → 引导启动 → 执行计划编排 → 执行器执行 → 收尾
+     *
+     * @param dto 聊天请求
+     * @return SSE 事件流
+     */
     @PostMapping(value = "/stream", produces = "text/event-stream;charset=UTF-8")
     public Flux<String> stream(@Valid @RequestBody ChatRequestDto dto) {
         return businessChatService.openConversationStream(dto);

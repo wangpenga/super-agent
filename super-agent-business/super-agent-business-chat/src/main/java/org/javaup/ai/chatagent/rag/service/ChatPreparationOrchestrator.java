@@ -38,8 +38,65 @@ import java.util.Objects;
 import java.util.Set;
 
 /**
+ * 聊天准备编排器 - 调用链路第5层
+ * <p>
+ * <b>在整个调用链路中的角色：</b>
+ * 在 Executor 执行之前，完成所有"理解用户意图 + 决定怎么执行"的准备工作。
+ * <p>
+ * <b>核心方法：</b>{@link #prepare(TaskInfo)} — 返回 {@link ConversationExecutionPlan}
+ * <p>
+ * <b>准备流程（按 chatMode 分派）：</b>
+ * <pre>
+ * prepare(taskInfo)
+ *   │
+ *   ├─ 1. summarizeHistory                     ← 装载会话记忆（长期摘要 + 近期窗口）
+ *   │     └─ conversationMemoryService.loadMemoryContext(conversationId)
+ *   │
+ *   ├─ 2. 时间感知判断                           ← TimeSensitiveQueryHelper
+ *   │     ├─ requiresCurrentDateAnchoring: 问题是否涉及"今天""当前"等时间词
+ *   │     └─ requiresFreshSearch: 问题是否涉及"最新""实时"等实时性词
+ *   │
+ *   ├─ 3. 按 chatMode 分派路由：
+ *   │     │
+ *   │     ├─ OPEN_CHAT 模式：
+ *   │     │   └─ mode = ExecutionMode.REACT_AGENT
+ *   │     │      → ReactAgentExecutor.execute()
+ *   │     │         └─ reactAgent.stream(agentQuestion, config)
+ *   │     │            内部：LLM 自主决定工具调用（联网搜索等）
+ *   │     │
+ *   │     ├─ AUTO_DOCUMENT 模式（自动知识库）：
+ *   │     │   ├─ knowledgeRouteService.route(question, rewriteQuestion)
+ *   │     │   │   → 返回 KnowledgeRouteDecision（含置信度 + 候选文档列表）
+ *   │     │   ├─ selectAutoCandidates → 筛选候选文档
+ *   │     │   ├─ shouldAskClarification? → 置信度 &lt; 0.55 或多候选歧义
+ *   │     │   │   ├─ YES → mode = ExecutionMode.CLARIFICATION
+ *   │     │   │   │       → ClarificationExecutor.execute()
+*      │     │   │   │          直接返回澄清问题文本（不调用 LLM）
+ *   │     │   │   └─ NO  → mode = ExecutionMode.RETRIEVAL
+ *   │     │   │            → 继续走下面的文档路由
+ *   │     │   └─ 选出 topDocument，继续走文档路由
+ *   │     │
+ *   │     └─ DOCUMENT 模式（指定文档）/ AUTO_DOCUMENT（确定文档后）：
+ *   │         ├─ chatQueryRewriteService.rewrite(question, historySummary)
+ *   │         │   → RagRewriteResult{rewrittenQuestion, subQuestions}
+ *   │         │      LLM 将口语化问题改写为检索友好的结构化查询
+ *   │         │
+ *   │         └─ documentQuestionRouter.route(documentId, question, rewriteResult)
+ *   │             → DocumentNavigationDecision{
+ *   │                 executionMode: GRAPH_ONLY | GRAPH_THEN_EVIDENCE | RETRIEVAL,
+ *   │                 retrievalPlan: {retrievalQuestion, subQuestions},
+ *   │                 structureAnchor: {structureNodeId, targetSectionHint},
+ *   │                 itemAnchor: {itemIndex}
+ *   │               }
+ *   │               判断：结构图直接回答？结构图定位+取证？还是走混合检索？
+ *   │
+ *   └─ 4. 构建 ConversationExecutionPlan
+ *       含：mode, rewriteQuestion, retrievalQuestion, navigationDecision,
+ *           selectedDocument, historySummary, noEvidenceReply 等
+ * </pre>
+ *
  * @program: 企业级别深度设计 AI Agent。添加 阿星不是程序员 微信，添加时备注 super 来获取项目的完整资料
- * @description: 服务层
+ * @description: 服务层 - 对话执行计划编排，负责在 LLM 执行前完成意图理解和路由决策
  * @author: 阿星不是程序员
  **/
 
@@ -83,10 +140,49 @@ public class ChatPreparationOrchestrator {
         this.documentKnowledgeService = documentKnowledgeService;
     }
 
+    /**
+     * 调用链路第5层核心方法 - 准备执行计划
+     * <p>
+     * <b>这是对话的"大脑"——在真正调用 LLM 之前，决定走哪条执行路径。</b>
+     * <p>
+     * <b>6 步准备流程：</b>
+     * <ol>
+     *   <li><b>会话记忆装载</b>（MEMORY 阶段）：
+     *       summarizeHistory → conversationMemoryService.loadMemoryContext
+     *       返回 ConversationMemoryContext{长期摘要, 近期对话窗口, 压缩信息}</li>
+     *   <li><b>历史规划上下文构建</b>：
+     *       从摘要中提取 conversationGoal（会话目标）、stableFacts（已确认事实）、
+     *       pendingQuestions（待跟进问题）、retrievalHints（检索提示）</li>
+     *   <li><b>时间感知判断</b>：
+     *       TimeSensitiveQueryHelper 判断问题是否涉及当日信息或需要实时搜索</li>
+     *   <li><b>模式路由（核心分派逻辑）</b>：
+     *       <ul>
+     *         <li>OPEN_CHAT → REACT_AGENT：Agent 自主决定工具调用</li>
+     *         <li>AUTO_DOCUMENT → 先走 KnowledgeRouteService 自动选择文档：
+     *           置信度 &lt; 0.55 或多候选歧义 → CLARIFICATION 先问用户
+     *           置信度 ≥ 0.55 且唯一 → 走文档路由</li>
+     *         <li>DOCUMENT / 确定文档的 AUTO_DOCUMENT → 走文档路由</li>
+     *       </ul>
+     *   </li>
+     *   <li><b>问题改写</b>（非 OPEN_CHAT 模式，REWRITE 阶段）：
+     *       chatQueryRewriteService.rewrite(原始问题, 历史摘要)
+     *       LLM 将口语化问题改写成检索友好的结构化查询 + 拆分子问题</li>
+     *   <li><b>文档路由决策</b>（ROUTE 阶段）：
+     *       documentQuestionRouter.route(documentId, question, rewriteResult)
+     *       判断应该走 GRAPH_ONLY / GRAPH_THEN_EVIDENCE / RETRIEVAL</li>
+     * </ol>
+     * <p>
+     * <b>产出：</b>{@link ConversationExecutionPlan} — 包含 ExecutionMode 和所有上下文信息，
+     * 后续由 ConversationExecutorRegistry 根据 mode 选择对应的执行器执行。
+     *
+     * @param taskInfo 运行时任务上下文（含 question, chatMode, traceRecorder 等）
+     * @return 完整的执行计划
+     */
     public ConversationExecutionPlan prepare(TaskInfo taskInfo) {
+        // ── 提取 taskInfo 中的关键参数 ──
         String conversationId = taskInfo.conversationId();
-        String question = taskInfo.question();
-        ChatQueryMode chatMode = taskInfo.chatMode();
+        String question = taskInfo.question();           // 用户原始提问
+        ChatQueryMode chatMode = taskInfo.chatMode();    // OPEN_CHAT / DOCUMENT / AUTO_DOCUMENT
         Long selectedDocumentId = taskInfo.selectedDocumentId();
         String selectedDocumentName = taskInfo.selectedDocumentName();
         Long selectedTaskId = taskInfo.selectedTaskId();
@@ -94,11 +190,16 @@ public class ChatPreparationOrchestrator {
         String currentDateText = taskInfo.currentDateText();
         ConversationTraceRecorder traceRecorder = taskInfo.traceRecorder();
 
+        // ═══════════════════════════════════════════════════════════════
+        // 步骤 1/6：装载会话记忆（MEMORY 阶段）
+        // ═══════════════════════════════════════════════════════════════
+        // 从 DB 加载长期摘要 + 近期对话窗口，用于构建 LLM 的历史上下文
         ConversationTraceRecorder.StageHandle memoryStage = traceRecorder == null
             ? null
             : traceRecorder.startStage(ConversationTraceStageCode.MEMORY, chatMode == null ? "" : chatMode.name(), "正在装载会话记忆与最近窗口。", null);
         ConversationMemoryContext memoryContext;
         try {
+            // 调用记忆服务：读取 memory_summary 表 + 近期 exchange 表数据
             memoryContext = summarizeHistory(conversationId, traceRecorder);
             if (traceRecorder != null) {
                 traceRecorder.completeStage(memoryStage, "会话记忆装载完成。", Map.of(
@@ -119,23 +220,41 @@ public class ChatPreparationOrchestrator {
             throw exception;
         }
 
+        // ═══════════════════════════════════════════════════════════════
+        // 步骤 2/6：构建历史上下文
+        // ═══════════════════════════════════════════════════════════════
+        // 历史规划上下文：结构化的会话目标、已确认事实、待跟进问题（给导航决策用的）
         HistoryPlanningContext historyPlanningContext = buildHistoryPlanningContext(memoryContext);
+        // 历史摘要：精炼后的近期对话文本（注入到 LLM Prompt 中）
         String historySummary = buildPlanningHistory(memoryContext, historyPlanningContext);
+        // 回答历史上下文：判断当前问题是否为追问（如"那第二个呢？"）
         AnswerHistoryContext answerHistoryContext = buildAnswerHistoryContext(
             question,
             memoryContext == null ? "" : memoryContext.getAnswerRecentTranscript()
         );
 
+        // ═══════════════════════════════════════════════════════════════
+        // 步骤 3/6：时间感知判断
+        // ═══════════════════════════════════════════════════════════════
+        // 判断问题是否涉及"今天"/"当前"等时间词 → 需要日期锚定
         boolean requiresCurrentDateAnchoring = TimeSensitiveQueryHelper.requiresCurrentDateAnchoring(question);
+        // 判断问题是否涉及"最新"/"实时"等词 → 需要实时联网搜索
         boolean requiresFreshSearch = TimeSensitiveQueryHelper.requiresFreshSearch(question);
+
         if (chatMode == null) {
             throw new IllegalArgumentException("chatMode 不能为空");
         }
 
+        // ═══════════════════════════════════════════════════════════════
+        // 步骤 4/6：按 chatMode 分派路由（核心决策！）
+        // ═══════════════════════════════════════════════════════════════
+
+        // ────────── 路径 A：OPEN_CHAT 开放式提问 ──────────
+        // 不需要改写、不需要检索，直接把问题交给 ReactAgent
         if (chatMode == ChatQueryMode.OPEN_CHAT) {
             ConversationExecutionPlan plan = basePlan(question, chatMode, memoryContext, historyPlanningContext, historySummary, answerHistoryContext, currentDate, currentDateText,
                 requiresCurrentDateAnchoring, requiresFreshSearch)
-                .mode(ExecutionMode.REACT_AGENT)
+                .mode(ExecutionMode.REACT_AGENT)  // 走 ReactAgentExecutor
                 .build();
             if (traceRecorder != null) {
                 ConversationTraceRecorder.StageHandle routeStage = traceRecorder.startStage(ConversationTraceStageCode.ROUTE, ExecutionMode.REACT_AGENT.name(), "路由到开放式 Agent。", null);
@@ -146,28 +265,37 @@ public class ChatPreparationOrchestrator {
                     "requiresCurrentDateAnchoring", requiresCurrentDateAnchoring
                 ));
             }
-            return plan;
+            return plan;  // 提前返回，不执行后续的改写和检索逻辑
         }
 
+        // ────────── 文档模式前置校验 ──────────
+        // RAG 编排功能必须已启用
         if (!properties.isEnabled()) {
             throw new IllegalStateException("当前文档问答模式未启用，请先开启聊天侧 RAG 编排");
         }
+        // DOCUMENT 模式（显式指定文档）必须传 selectedDocumentId 和 selectedTaskId
         if (chatMode == ChatQueryMode.DOCUMENT && (selectedDocumentId == null || selectedTaskId == null)) {
             throw new IllegalArgumentException("当前文档问答模式缺少有效的文档范围");
         }
 
+        // ═══════════════════════════════════════════════════════════════
+        // 步骤 5/6：问题改写（REWRITE 阶段）—— 非 OPEN_CHAT 模式都要改写
+        // ═══════════════════════════════════════════════════════════════
+        // 调用 LLM 将口语化问题改写为检索友好的结构化查询 + 拆分子问题
         ConversationTraceRecorder.StageHandle rewriteStage = traceRecorder == null
             ? null
             : traceRecorder.startStage(
                 ConversationTraceStageCode.REWRITE,
                 ExecutionMode.RETRIEVAL.name(),
                 "正在生成检索友好的问题表达。",
-                buildRewriteStageSnapshot(question, historySummary, null)
+                buildRewriteStageSnapshot(question, historySummary, null)  // 改写前的快照（问题+历史上下文）
             );
         RagRewriteResult rewriteResult;
         try {
+            // LLM 改写：原始问题 + 历史摘要 → 改写问题 + 子问题列表
             rewriteResult = chatQueryRewriteService.rewrite(question, historySummary, traceRecorder);
             if (traceRecorder != null) {
+                // 记录改写后的快照（含 rewrittenQuestion + subQuestions + 原始模型输出）
                 traceRecorder.completeStage(rewriteStage, "问题改写完成。", buildRewriteStageSnapshot(question, historySummary, rewriteResult));
             }
         }
@@ -183,57 +311,80 @@ public class ChatPreparationOrchestrator {
             throw exception;
         }
 
+        // 改写结果 → 提取改写后的问题和子问题
         String rewriteQuestion = rewriteResult == null ? safeText(question) : firstNonBlank(rewriteResult.getRewrittenQuestion(), safeText(question));
         List<String> rewriteSubQuestions = rewriteResult == null || rewriteResult.getSubQuestions() == null || rewriteResult.getSubQuestions().isEmpty()
-            ? List.of(rewriteQuestion)
+            ? List.of(rewriteQuestion)     // 没有子问题就用改写后的问题本身
             : rewriteResult.getSubQuestions();
 
+        // ═══════════════════════════════════════════════════════════════
+        // 步骤 6/6：文档路由决策（ROUTE 阶段）
+        // ═══════════════════════════════════════════════════════════════
+
+        // ────────── 初始化文档路由变量 ──────────
+        // DOCUMENT 模式：直接用用户选定的文档（不变）
+        // AUTO_DOCUMENT 模式：下面会通过 knowledgeRouteService 重新选定
         Long routedDocumentId = selectedDocumentId;
         String routedDocumentName = selectedDocumentName;
         Long routedTaskId = selectedTaskId;
         List<Long> routedDocumentIds = routedDocumentId == null ? List.of() : List.of(routedDocumentId);
         List<Long> routedTaskIds = routedTaskId == null ? List.of() : List.of(routedTaskId);
+
         if (chatMode == ChatQueryMode.AUTO_DOCUMENT) {
+            // ─── 路径 B：AUTO_DOCUMENT 自动知识路由 ───
+            // ① 调用知识路由服务，根据问题内容自动匹配最相关的文档
             KnowledgeRouteDecision routeDecision = knowledgeRouteService.route(question, rewriteQuestion);
+            // ② 记录路由追踪（用于后续分析路由准确性）
             knowledgeRouteService.recordAutoRoute(conversationId, taskInfo.exchangeId(), question, rewriteQuestion, routeDecision);
+            // ③ 筛选候选文档列表
             List<DocumentRouteCandidate> candidateDocuments = selectAutoCandidates(routeDecision, question, rewriteQuestion);
+
+            // ─── 判断是否需要向用户澄清 ───
+            // 条件：置信度 < 0.55 或 候选文档 > 1 且 top2 分数接近
             if (shouldAskClarification(routeDecision, candidateDocuments)) {
+                // 返回 CLARIFICATION 执行计划：直接问用户想查哪个文档，不调 LLM
                 return basePlan(question, chatMode, memoryContext, historyPlanningContext, historySummary, answerHistoryContext, currentDate, currentDateText,
                     requiresCurrentDateAnchoring, requiresFreshSearch)
-                    .mode(ExecutionMode.CLARIFICATION)
+                    .mode(ExecutionMode.CLARIFICATION)  // 走 ClarificationExecutor
                     .rewriteQuestion(rewriteQuestion)
                     .rewriteSubQuestions(rewriteSubQuestions)
                     .retrievalQuestion(rewriteQuestion)
                     .retrievalSubQuestions(rewriteSubQuestions)
-                    .retrievalDocumentIds(candidateDocuments.stream()
+                    .retrievalDocumentIds(candidateDocuments.stream()  // 候选文档 ID 列表
                         .map(DocumentRouteCandidate::getDocumentId)
                         .filter(StrUtil::isNotBlank)
                         .map(Long::valueOf)
                         .toList())
-                    .retrievalTaskIds(candidateDocuments.stream()
+                    .retrievalTaskIds(candidateDocuments.stream()  // 候选文档的索引任务 ID 列表
                         .map(DocumentRouteCandidate::getLastIndexTaskId)
                         .filter(StrUtil::isNotBlank)
                         .map(Long::valueOf)
                         .toList())
-                    .clarificationReply(buildClarificationReply(question, routeDecision, candidateDocuments))
-                    .clarificationOptions(buildClarificationOptions(candidateDocuments))
-                    .clarificationReason(buildClarificationReason(routeDecision, candidateDocuments))
+                    .clarificationReply(buildClarificationReply(question, routeDecision, candidateDocuments))     // "你想问哪份文档？1. A 2. B"
+                    .clarificationOptions(buildClarificationOptions(candidateDocuments))                          // ["我想问《A》", "我想问《B》"]
+                    .clarificationReason(buildClarificationReason(routeDecision, candidateDocuments))             // "置信度 0.42，为避免误选..."
                     .build();
             }
+
+            // ─── 不需要澄清 → 确定 top 文档 ───
+            // 置信度 >= 0.55 且至少有 1 个候选 → 选第一个作为目标文档
             boolean confidentTopDocument = routeDecision != null
                 && routeDecision.getConfidence() != null
                 && routeDecision.getConfidence().doubleValue() >= 0.55D;
             DocumentRouteCandidate topDocument = confidentTopDocument && !candidateDocuments.isEmpty() ? candidateDocuments.get(0) : null;
             if (topDocument != null && StrUtil.isNotBlank(topDocument.getDocumentId()) && StrUtil.isNotBlank(topDocument.getLastIndexTaskId())) {
+                // 路由成功：用自动选定的文档替换 selectedDocument
                 routedDocumentId = Long.valueOf(topDocument.getDocumentId());
                 routedDocumentName = topDocument.getDocumentName();
                 routedTaskId = Long.valueOf(topDocument.getLastIndexTaskId());
             }
             else {
+                // 路由失败（置信度不足或候选为空）→ 清空文档信息，走兜底
                 routedDocumentId = null;
                 routedDocumentName = "";
                 routedTaskId = null;
             }
+            // 候选文档列表（可能多个，用于后续的多文档检索）
             routedDocumentIds = candidateDocuments.stream()
                 .map(DocumentRouteCandidate::getDocumentId)
                 .filter(StrUtil::isNotBlank)
@@ -244,6 +395,7 @@ public class ChatPreparationOrchestrator {
                 .filter(StrUtil::isNotBlank)
                 .map(Long::valueOf)
                 .toList();
+
             if (traceRecorder != null) {
                 traceRecorder.completeStage(
                     traceRecorder.startStage(ConversationTraceStageCode.ROUTE, "AUTO_DOCUMENT", "正在生成知识范围候选。", null),
@@ -260,14 +412,20 @@ public class ChatPreparationOrchestrator {
             }
         }
         else if (chatMode == ChatQueryMode.DOCUMENT) {
+            // ─── 路径 C：DOCUMENT 显式指定文档 ───
+            // 记录一条 shadow route trace（即使不自动路由，也记录用于分析）
             knowledgeRouteService.recordShadowRoute(conversationId, taskInfo.exchangeId(), selectedDocumentId, question, rewriteQuestion);
         }
 
+        // ────────── 公共路径：文档路由决策（DOCUMENT + AUTO_DOCUMENT 确定文档后）──────────
+        // 调用 documentQuestionRouter 判断具体执行方式：
+        // GRAPH_ONLY（结构图直接回答）、GRAPH_THEN_EVIDENCE（结构图定位+校验）、RETRIEVAL（混合检索）
         ConversationTraceRecorder.StageHandle routeStage = traceRecorder == null
             ? null
             : traceRecorder.startStage(ConversationTraceStageCode.ROUTE, ExecutionMode.RETRIEVAL.name(), "正在判定图查询还是混合检索。", null);
         DocumentNavigationDecision navigationDecision;
         try {
+            // 核心：调用路由器判定执行模式
             navigationDecision = documentQuestionRouter.route(routedDocumentId, question, rewriteResult);
             if (traceRecorder != null) {
                 traceRecorder.completeStage(routeStage, "执行路由完成。", Map.of(
@@ -287,12 +445,16 @@ public class ChatPreparationOrchestrator {
             throw exception;
         }
 
+        // ────────── 从路由决策中提取执行模式和检索参数 ──────────
+        // 执行模式：默认为 RETRIEVAL（兜底策略），有决策就用决策的
         ExecutionMode executionMode = navigationDecision == null || navigationDecision.getExecutionMode() == null
             ? ExecutionMode.RETRIEVAL
             : navigationDecision.getExecutionMode();
+        // 检索问题：路由器可能调整了检索问题（比改写更精确）
         String retrievalQuestion = navigationDecision == null || navigationDecision.getRetrievalPlan() == null
             ? rewriteQuestion
             : firstNonBlank(navigationDecision.getRetrievalPlan().getRetrievalQuestion(), rewriteQuestion);
+        // 检索子问题：路由器可能调整了子问题拆分
         List<String> retrievalSubQuestions = navigationDecision == null || navigationDecision.getRetrievalPlan() == null
             || navigationDecision.getRetrievalPlan().getSubQuestions() == null || navigationDecision.getRetrievalPlan().getSubQuestions().isEmpty()
             ? rewriteSubQuestions
@@ -307,20 +469,22 @@ public class ChatPreparationOrchestrator {
             executionMode,
             navigationDecision == null || navigationDecision.getStructureAnchor() == null ? "" : safeText(navigationDecision.getStructureAnchor().getTargetSectionHint()));
 
+        // ────────── 组装最终的 ConversationExecutionPlan ──────────
+        // basePlan 填入公共字段（历史、时间感知、兜底文本），Builder 链式填入路由决策特有字段
         return basePlan(question, chatMode, memoryContext, historyPlanningContext, historySummary, answerHistoryContext, currentDate, currentDateText,
             requiresCurrentDateAnchoring, requiresFreshSearch)
-            .mode(executionMode)
-            .navigationDecision(navigationDecision)
-            .rewriteQuestion(rewriteQuestion)
-            .rewriteSubQuestions(rewriteSubQuestions)
-            .retrievalQuestion(retrievalQuestion)
-            .retrievalSubQuestions(retrievalSubQuestions)
-            .selectedDocumentId(routedDocumentId)
-            .selectedDocumentName(routedDocumentName)
-            .selectedTaskId(routedTaskId)
-            .retrievalDocumentIds(routedDocumentIds)
-            .retrievalTaskIds(routedTaskIds)
-            .noEvidenceReply(buildDocumentModeNoEvidenceReply(question, requiresFreshSearch))
+            .mode(executionMode)                          // ← 最终决定走哪个 Executor
+            .navigationDecision(navigationDecision)       // ← 路由决策（含结构图锚点 + 检索计划）
+            .rewriteQuestion(rewriteQuestion)             // ← 改写后的问题
+            .rewriteSubQuestions(rewriteSubQuestions)     // ← 改写后的子问题
+            .retrievalQuestion(retrievalQuestion)         // ← 最终检索问题
+            .retrievalSubQuestions(retrievalSubQuestions) // ← 最终检索子问题
+            .selectedDocumentId(routedDocumentId)         // ← 目标文档 ID
+            .selectedDocumentName(routedDocumentName)     // ← 目标文档名
+            .selectedTaskId(routedTaskId)                 // ← 目标索引任务 ID
+            .retrievalDocumentIds(routedDocumentIds)      // ← 候选文档 ID 列表（AUTO_DOCUMENT 可能多文档）
+            .retrievalTaskIds(routedTaskIds)              // ← 候选任务 ID 列表
+            .noEvidenceReply(buildDocumentModeNoEvidenceReply(question, requiresFreshSearch))  // ← 无证据兜底文本
             .build();
     }
 
