@@ -16,6 +16,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import static com.google.common.base.Throwables.getStackTraceAsString;
+
 /**
  * 对话执行追踪记录器
  * <p>
