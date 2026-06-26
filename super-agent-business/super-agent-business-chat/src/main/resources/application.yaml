@@ -16,7 +16,8 @@ spring:
       database: 0
       host: 127.0.0.1
       port: 6379
-      timeout: 3000  
+      timeout: 3000
+      password: 123456
   datasource:
     url: jdbc:mysql://127.0.0.1:3306/super_agent_business_chat?createDatabaseIfNotExist=true&useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
     username: root
@@ -255,10 +256,10 @@ app:
       endpoint: http://127.0.0.1:9000
       # MinIO 访问账号。
       # 本地开发通常使用默认账号，生产环境建议改成专用 AK。
-      access-key: minioadmin
+      access-key: admin
       # MinIO 访问密码。
       # 生产环境不要直接写死在配置文件里，建议通过环境变量或配置中心下发。
-      secret-key: minioadmin
+      secret-key: 12345678
       # 文档管理模块统一使用的 bucket 名称。
       # 应用启动时会自动检查这个 bucket 是否存在，不存在就自动创建。
       bucket-name: ${prefix.distinction.name:super-agent-document}
