@@ -316,7 +316,7 @@ app:
       # PostgreSQL 用户名。
       username: postgres
       # PostgreSQL 密码。
-      password: postgres
+      password: 123456
       # 连接池名称，方便日志和监控定位。
       pool-name: super-agent-manage-pgvector-hikari
       # 连接池最大连接数。
