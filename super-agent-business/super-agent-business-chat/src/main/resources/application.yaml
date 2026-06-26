@@ -10,7 +10,7 @@ prefix:
     name: super-agent
 spring:
   application:
-    name: ${prefix.distinction.name:super-agent}-business-chat
+    name: ${prefix.distinction.name:super-agent-business-chat}
   data:
     redis:
       database: 0
@@ -20,7 +20,7 @@ spring:
   datasource:
     url: jdbc:mysql://127.0.0.1:3306/super_agent_business_chat?createDatabaseIfNotExist=true&useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
     username: root
-    password: root
+    password: 123456
     driver-class-name: com.mysql.cj.jdbc.Driver
     hikari:
       pool-name: super-agent-business-chat-hikari
@@ -43,7 +43,7 @@ spring:
       base-url: https://dashscope.aliyuncs.com/compatible-mode/
       # OpenAI 兼容协议的访问密钥。
       # 正式环境建议改成环境变量注入，不要把真实密钥直接写在配置文件里。
-      api-key: ${ALI_BAI_LIAN_API_KEY}
+      api-key: ${ALI_BAI_LIAN_API_KEY:sk-e3519ff6a9244c5494075bff7126013a}
       chat:
         options:
           # 对话模型名称。
@@ -56,7 +56,7 @@ spring:
         # embedding 单独指定 base-url，便于后续把对话模型和向量模型拆到不同网关时直接切换。
         base-url: https://dashscope.aliyuncs.com/compatible-mode/
         # embedding 调用使用的密钥。
-        api-key: ${ALI_BAI_LIAN_API_KEY}
+        api-key: ${ALI_BAI_LIAN_API_KEY:sk-e3519ff6a9244c5494075bff7126013a}
         options:
           # 向量模型名称。
           # 当前文档切块向量化时，会直接使用这里配置的模型，不再额外在 manage 下重复维护一份。
@@ -229,7 +229,7 @@ app:
     search-path: /search
     # Tavily 的 API Key。
     # 推荐通过环境变量注入，避免把真实密钥写进配置文件。
-    api-key: ${TAVILY_API_KEY}
+    api-key: ${TAVILY_API_KEY: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}
     # 搜索主题类型。
     # Tavily 当前只接受 general、news、finance 三个枚举值。
     # 一般场景优先用 general。
@@ -261,7 +261,7 @@ app:
       secret-key: minioadmin
       # 文档管理模块统一使用的 bucket 名称。
       # 应用启动时会自动检查这个 bucket 是否存在，不存在就自动创建。
-      bucket-name: ${prefix.distinction.name:super-agent}-document
+      bucket-name: ${prefix.distinction.name:super-agent-document}
       # 原始文件对象前缀。
       # 最终对象路径一般会在这个前缀下再拼接文档 id 和文件名。
       object-prefix: rag/document
@@ -333,11 +333,11 @@ app:
       # Elasticsearch 密码。
       password: ${ELASTICSEARCH_PASSWORD:elastic}
       # 关键词索引名称。
-      index-name: ${prefix.distinction.name:super-agent}-document-keyword
+      index-name: ${prefix.distinction.name:super-agent-document-keyword}
       # 导航层结构节点索引名称，粒度是 section/step/list_item，不和 chunk 级关键词索引混用。
-      navigation-index-name: ${prefix.distinction.name:super-agent}-document-navigation
+      navigation-index-name: ${prefix.distinction.name:super-agent-document-navigation}
       # 知识路由索引名称，粒度是 scope/topic/document 路由元数据，不和正文索引混用。
-      route-index-name: ${prefix.distinction.name:super-agent}-knowledge-route
+      route-index-name: ${prefix.distinction.name:super-agent-knowledge-route}
       # 建索引 analyzer。
       # 如果本地未安装 IK 插件，启动时会自动回退到 standard。
       analyzer: ik_max_word
