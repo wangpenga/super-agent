@@ -184,13 +184,16 @@ public ConversationMemoryContext loadMemoryContext(String conversationId, Conver
         conversationId,
         recentFetchLimit(historySummaryProperties.getKeepRecentTurns())  // 多拉一点防止过滤后不够
     );
-    // ④ 渲染近期对话原文（给 LLM 看的）
+    // ④ 渲染近期对话原文（含 Q+A，注入 LLM Prompt 作为完整对话上下文）
     String recentTranscript = renderRecentTranscript(
         recentExchanges,
         historySummaryProperties.getKeepRecentTurns(),
         historySummaryProperties.getRecentTranscriptMaxChars()
     );
-    // ⑤ 渲染近期助手回答（用于追问判断）
+    // ⑤ 渲染近期对话（仅含 Q，不含 A）—— 专用于追问判断
+    // 与 recentTranscript 的区别：只渲染 question，不渲染 answer。
+    // 原因：AnswerHistoryContextAssembler 通过这个文本判断"用户现在的提问是不是对上轮回答的追问"，
+    // 它只需要知道用户问过什么，不需要助手答过什么。省下的字符预算可以覆盖更多轮次。
     String answerRecentTranscript = renderAnswerRecentTranscript(
         recentExchanges,
         historySummaryProperties.getKeepRecentTurns(),
@@ -351,48 +354,94 @@ private SuperAgentChatMemorySummary refreshSummaryIfNecessary(String conversatio
     return workingState;
 }
 
+    /**
+     * 合并会话长期摘要 —— 调 LLM 把已有摘要 + 新对话批次合并为新的结构化摘要
+     * <p>
+     * <b>两条路径：</b>
+     * <ol>
+     *   <li><b>LLM 路径（正常）</b>：调 callText → 解析 JSON → normalizePayload 返回</li>
+     *   <li><b>规则路径（兜底）</b>：LLM 调用异常或解析失败 → fallbackMerge</li>
+     * </ol>
+     *
+     * @param existingPayload 已有的长期摘要（可能为空）
+     * @param batch           要被压缩的新对话批次
+     * @param traceRecorder   追踪记录器
+     * @return 合并后的 ConversationSummaryPayload
+     */
     private ConversationSummaryPayload mergeSummaryPayload(ConversationSummaryPayload existingPayload,
                                                            List<ConversationExchangeView> batch,
                                                            ConversationTraceRecorder traceRecorder) {
         try {
+            // ① 调 LLM：把已有摘要 JSON + 新对话批次 → 新的结构化摘要 JSON
             String content = observedChatModelService.callText(
-                "summary",
-                promptTemplateService.render(PromptTemplateNames.CONVERSATION_SUMMARY_SYSTEM, Map.of()),
-                buildSummaryMergePrompt(existingPayload, batch),
+                "summary",                                                      // stageName
+                promptTemplateService.render(PromptTemplateNames.CONVERSATION_SUMMARY_SYSTEM, Map.of()),  // system prompt
+                buildSummaryMergePrompt(existingPayload, batch),                // user prompt（含已有摘要+新对话）
                 traceRecorder
             );
+            // ② 从 LLM 输出中提取 JSON 对象，反序列化为 ConversationSummaryPayload
             ConversationSummaryPayload parsedPayload = parseSummaryPayload(content);
             if (parsedPayload != null) {
+                // ③ 规范化：裁剪超长字段 + 去重 + 限制条数
                 return normalizePayload(parsedPayload);
             }
         }
         catch (Exception exception) {
+            // LLM 调用失败 → 走规则兜底，不抛异常
             log.warn("合并会话长期摘要失败，回退到规则压缩: {}", exception.getMessage());
         }
+        // ④ LLM 失败或解析失败 → 纯规则拼接（不依赖 LLM）
         return fallbackMerge(existingPayload, batch);
     }
 
+    /**
+     * 构建摘要合并的 LLM Prompt
+     * <p>
+     * 产物是给 LLM 的 user prompt，包含两个变量：
+     * <ul>
+     *   <li><b>existingSummaryJson</b>：已有的长期摘要 JSON（首次压缩时为 {}）</li>
+     *   <li><b>newConversationBatch</b>：格式化的近期对话批次文本（Q+A，按句子边界截断）</li>
+     * </ul>
+     */
     private String buildSummaryMergePrompt(ConversationSummaryPayload existingPayload,
                                            List<ConversationExchangeView> batch) {
+        // 将已有摘要序列化为 JSON（先 copy 一份防止污染原对象）
         String existingJson = writePayloadJson(normalizePayload(copyPayload(existingPayload)));
+        // 用 conversation-summary-merge.st 模板渲染 user prompt
         return promptTemplateService.render(PromptTemplateNames.CONVERSATION_SUMMARY_MERGE, Map.of(
             "existingSummaryJson", StrUtil.isNotBlank(existingJson) ? existingJson : "{}",
             "newConversationBatch", renderCompressionTranscript(batch)
         ));
     }
 
+    /**
+     * 规则兜底：不调 LLM，用纯文本拼接来更新摘要
+     * <p>
+     * 当 LLM 调用失败时使用。处理逻辑（按优先级）：
+     * <ol>
+     *   <li>摘要文本拼接：旧摘要 + 新对话高亮 → 合并为一段</li>
+     *   <li>会话目标：如果为空，用最后一条提问填空</li>
+     *   <li>待跟进问题：把本批所有提问追加进去</li>
+     *   <li>检索提示：从最后一条提问中提取关键词</li>
+     * </ol>
+     * 这不如 LLM 生成的摘要质量高，但保证系统不会因为 LLM 故障而崩溃。
+     */
     private ConversationSummaryPayload fallbackMerge(ConversationSummaryPayload existingPayload,
                                                      List<ConversationExchangeView> batch) {
+        // ① 拷贝一份已有摘要，避免污染传入的对象
         ConversationSummaryPayload mergedPayload = copyPayload(existingPayload);
+        // ② 从新对话批次中提取高亮文本（最多 4 条），与旧摘要拼接
         String batchHighlight = renderFallbackBatchHighlight(batch);
         String mergedSummary = joinNonBlank(mergedPayload.getSummary(), batchHighlight, "；");
         mergedPayload.setSummary(clipText(mergedSummary, properties.getHistorySummary().getSummaryMaxChars()));
 
+        // ③ 如果还没有会话目标，拿本批最后一条提问来填
         ConversationExchangeView lastExchange = batch.get(batch.size() - 1);
         if (StrUtil.isBlank(mergedPayload.getConversationGoal()) && StrUtil.isNotBlank(lastExchange.getQuestion())) {
             mergedPayload.setConversationGoal(clipText(lastExchange.getQuestion(), MAX_GOAL_LENGTH));
         }
 
+        // ④ 把本批所有提问追加到待跟进问题中
         List<String> pendingQuestions = new ArrayList<>(safeList(mergedPayload.getPendingQuestions()));
         for (ConversationExchangeView exchange : batch) {
             if (StrUtil.isNotBlank(exchange.getQuestion())) {
@@ -401,120 +450,170 @@ private SuperAgentChatMemorySummary refreshSummaryIfNecessary(String conversatio
         }
         mergedPayload.setPendingQuestions(deduplicateAndLimit(pendingQuestions));
 
+        // ⑤ 从最后一条提问中提取检索关键词
         List<String> retrievalHints = new ArrayList<>(safeList(mergedPayload.getRetrievalHints()));
         if (StrUtil.isNotBlank(lastExchange.getQuestion())) {
             retrievalHints.addAll(extractRetrievalHints(lastExchange.getQuestion()));
         }
         mergedPayload.setRetrievalHints(deduplicateAndLimit(retrievalHints));
+        // ⑥ 再次规范化（裁剪 + 去重）
         return normalizePayload(mergedPayload);
     }
 
-    private SuperAgentChatMemorySummary saveSummarySnapshot(String conversationId,
-                                                            SuperAgentChatMemorySummary currentState,
-                                                            ConversationSummaryPayload payload,
-                                                            long coveredExchangeId,
-                                                            int coveredExchangeCount,
-                                                            Date lastSourceEditTime) {
-        SuperAgentChatMemorySummary latestState = findSummary(conversationId).orElse(null);
-        long latestCoveredExchangeId = latestState == null ? 0L : defaultLong(latestState.getCoveredExchangeId());
+/**
+ * 保存摘要快照到 memory_summary 表（INSERT 或 UPDATE）
+ * <p>
+ * <b>并发安全设计：</b>
+ * <ol>
+ *   <li>写入前重新查询 DB（latestState），防止覆盖其他线程/节点的最新写入</li>
+ *   <li>如果 DB 中的 coveredExchangeId 已经比当前大 → 放弃写入，返回 DB 中的最新版</li>
+ *   <li>如果 DB 中的 coveredExchangeId 相同且已有内容 → 也跳过（幂等去重）</li>
+ *   <li>首次保存 → INSERT；后续保存 → UPDATE，compressionCount +1, summaryVersion +1</li>
+ * </ol>
+ *
+ * @param conversationId      会话 ID
+ * @param currentState        当前内存中的摘要状态
+ * @param payload             要保存的摘要内容
+ * @param coveredExchangeId   本次覆盖到的 exchangeId
+ * @param coveredExchangeCount 累计覆盖轮次数
+ * @param lastSourceEditTime  源轮次最后编辑时间
+ * @return 最新的摘要记录
+ */
+private SuperAgentChatMemorySummary saveSummarySnapshot(String conversationId,
+                                                        SuperAgentChatMemorySummary currentState,
+                                                        ConversationSummaryPayload payload,
+                                                        long coveredExchangeId,
+                                                        int coveredExchangeCount,
+                                                        Date lastSourceEditTime) {
+    // ① 重新查 DB，获取最新状态（防止并发覆盖）
+    SuperAgentChatMemorySummary latestState = findSummary(conversationId).orElse(null);
+    long latestCoveredExchangeId = latestState == null ? 0L : defaultLong(latestState.getCoveredExchangeId());
 
-        if (latestCoveredExchangeId > coveredExchangeId) {
-            return latestState;
-        }
-
-        if (latestState != null
-            && latestCoveredExchangeId == coveredExchangeId
-            && StrUtil.isNotBlank(latestState.getSummaryText())) {
-            return latestState;
-        }
-
-        String summaryText = buildLongTermSummaryText(payload);
-        String summaryJson = writePayloadJson(payload);
-
-        if (latestState == null) {
-            SuperAgentChatMemorySummary newState = new SuperAgentChatMemorySummary();
-            newState.setId(uidGenerator.getUid());
-            newState.setConversationId(conversationId);
-            newState.setCoveredExchangeId(coveredExchangeId);
-            newState.setCoveredExchangeCount(Math.max(coveredExchangeCount, 0));
-            newState.setCompressionCount(1);
-            newState.setSummaryVersion(1);
-            newState.setSummaryText(summaryText);
-            newState.setSummaryJson(summaryJson);
-            newState.setLastSourceEditTime(lastSourceEditTime);
-            newState.setStatus(BusinessStatus.YES.getCode());
-            summaryMapper.insert(newState);
-            return newState;
-        }
-
-        SuperAgentChatMemorySummary updateState = new SuperAgentChatMemorySummary();
-        updateState.setId(latestState.getId());
-        updateState.setCoveredExchangeId(coveredExchangeId);
-        updateState.setCoveredExchangeCount(Math.max(coveredExchangeCount, safeInt(latestState.getCoveredExchangeCount())));
-        updateState.setCompressionCount(safeInt(latestState.getCompressionCount()) + 1);
-        updateState.setSummaryVersion(safeInt(latestState.getSummaryVersion()) + 1);
-        updateState.setSummaryText(summaryText);
-        updateState.setSummaryJson(summaryJson);
-        updateState.setLastSourceEditTime(lastSourceEditTime);
-        summaryMapper.updateById(updateState);
-
-        latestState.setCoveredExchangeId(updateState.getCoveredExchangeId());
-        latestState.setCoveredExchangeCount(updateState.getCoveredExchangeCount());
-        latestState.setCompressionCount(updateState.getCompressionCount());
-        latestState.setSummaryVersion(updateState.getSummaryVersion());
-        latestState.setSummaryText(updateState.getSummaryText());
-        latestState.setSummaryJson(updateState.getSummaryJson());
-        latestState.setLastSourceEditTime(updateState.getLastSourceEditTime());
+    // ② DB 中已经有更新的覆盖进度 → 放弃本次写入，返回 DB 中的版本
+    if (latestCoveredExchangeId > coveredExchangeId) {
         return latestState;
     }
 
-    private Optional<SuperAgentChatMemorySummary> findSummary(String conversationId) {
-        return Optional.ofNullable(summaryMapper.selectOne(
-            new LambdaQueryWrapper<SuperAgentChatMemorySummary>()
-                .eq(SuperAgentChatMemorySummary::getConversationId, conversationId)
-                .orderByDesc(SuperAgentChatMemorySummary::getId)
-                .last("LIMIT 1")
-        ));
+    // ③ 覆盖进度相同且 DB 已有内容 → 幂等跳过（可能被并发执行了两次）
+    if (latestState != null
+        && latestCoveredExchangeId == coveredExchangeId
+        && StrUtil.isNotBlank(latestState.getSummaryText())) {
+        return latestState;
     }
 
-    private ConversationSummaryPayload readSummaryPayload(SuperAgentChatMemorySummary summaryState) {
-        if (summaryState == null) {
-            return ConversationSummaryPayload.builder().build();
-        }
-        if (StrUtil.isNotBlank(summaryState.getSummaryJson())) {
-            ConversationSummaryPayload payload = parseSummaryPayload(summaryState.getSummaryJson());
-            if (payload != null) {
-                return normalizePayload(payload);
-            }
-        }
-        ConversationSummaryPayload fallbackPayload = ConversationSummaryPayload.builder()
-            .summary(summaryState.getSummaryText())
-            .build();
-        return normalizePayload(fallbackPayload);
+    // ④ 将结构化 payload 转为文本和 JSON
+    String summaryText = buildLongTermSummaryText(payload);
+    String summaryJson = writePayloadJson(payload);
+
+    // ⑤ 分支 A：首次保存 → INSERT
+    if (latestState == null) {
+        SuperAgentChatMemorySummary newState = new SuperAgentChatMemorySummary();
+        newState.setId(uidGenerator.getUid());
+        newState.setConversationId(conversationId);
+        newState.setCoveredExchangeId(coveredExchangeId);
+        newState.setCoveredExchangeCount(Math.max(coveredExchangeCount, 0));
+        newState.setCompressionCount(1);           // 首次压缩 = 1
+        newState.setSummaryVersion(1);
+        newState.setSummaryText(summaryText);
+        newState.setSummaryJson(summaryJson);
+        newState.setLastSourceEditTime(lastSourceEditTime);
+        newState.setStatus(BusinessStatus.YES.getCode());
+        summaryMapper.insert(newState);
+        return newState;
     }
 
-    private ConversationSummaryPayload parseSummaryPayload(String raw) {
-        if (StrUtil.isBlank(raw)) {
-            return null;
-        }
-        try {
-            JsonNode root = objectMapper.readTree(extractJsonObject(raw));
-            ConversationSummaryPayload payload = ConversationSummaryPayload.builder()
-                .summary(root.path("summary").asText(""))
-                .conversationGoal(root.path("conversation_goal").asText(""))
-                .stableFacts(readStringArray(root.path("stable_facts")))
-                .userPreferences(readStringArray(root.path("user_preferences")))
-                .resolvedPoints(readStringArray(root.path("resolved_points")))
-                .pendingQuestions(readStringArray(root.path("pending_questions")))
-                .retrievalHints(readStringArray(root.path("retrieval_hints")))
-                .build();
+    // ⑥ 分支 B：已有记录 → UPDATE（累加版本号和压缩次数）
+    SuperAgentChatMemorySummary updateState = new SuperAgentChatMemorySummary();
+    updateState.setId(latestState.getId());
+    updateState.setCoveredExchangeId(coveredExchangeId);                                  // 推进覆盖进度
+    updateState.setCoveredExchangeCount(Math.max(coveredExchangeCount, safeInt(latestState.getCoveredExchangeCount())));
+    updateState.setCompressionCount(safeInt(latestState.getCompressionCount()) + 1);       // 压缩次数 +1
+    updateState.setSummaryVersion(safeInt(latestState.getSummaryVersion()) + 1);           // 版本号 +1
+    updateState.setSummaryText(summaryText);
+    updateState.setSummaryJson(summaryJson);
+    updateState.setLastSourceEditTime(lastSourceEditTime);
+    summaryMapper.updateById(updateState);
+
+    // ⑦ 回写到 latestState，让调用方能拿到最新值（避免调用方再次查 DB）
+    latestState.setCoveredExchangeId(updateState.getCoveredExchangeId());
+    latestState.setCoveredExchangeCount(updateState.getCoveredExchangeCount());
+    latestState.setCompressionCount(updateState.getCompressionCount());
+    latestState.setSummaryVersion(updateState.getSummaryVersion());
+    latestState.setSummaryText(updateState.getSummaryText());
+    latestState.setSummaryJson(updateState.getSummaryJson());
+    latestState.setLastSourceEditTime(updateState.getLastSourceEditTime());
+    return latestState;
+}
+
+/** 按 conversationId 查 memory_summary 表（取最新一条） */
+private Optional<SuperAgentChatMemorySummary> findSummary(String conversationId) {
+    return Optional.ofNullable(summaryMapper.selectOne(
+        new LambdaQueryWrapper<SuperAgentChatMemorySummary>()
+            .eq(SuperAgentChatMemorySummary::getConversationId, conversationId)
+            .orderByDesc(SuperAgentChatMemorySummary::getId)
+            .last("LIMIT 1")
+    ));
+}
+
+/**
+ * 从 DB 记录中反序列化 ConversationSummaryPayload
+ * <p>
+ * 优先用 summaryJson 字段（结构化 JSON），解析失败或为空时
+ * 用 summaryText 字段做兜底（纯文本摘要，无结构字段）。
+ */
+private ConversationSummaryPayload readSummaryPayload(SuperAgentChatMemorySummary summaryState) {
+    if (summaryState == null) {
+        return ConversationSummaryPayload.builder().build();
+    }
+    // 优先：从 summaryJson 解析结构化数据
+    if (StrUtil.isNotBlank(summaryState.getSummaryJson())) {
+        ConversationSummaryPayload payload = parseSummaryPayload(summaryState.getSummaryJson());
+        if (payload != null) {
             return normalizePayload(payload);
         }
-        catch (Exception exception) {
-            log.debug("解析会话长期摘要 JSON 失败: {}", raw, exception);
-            return null;
-        }
     }
+    // 兜底：summaryJson 为空或解析失败 → 用 summaryText 做纯文本摘要
+    ConversationSummaryPayload fallbackPayload = ConversationSummaryPayload.builder()
+        .summary(summaryState.getSummaryText())
+        .build();
+    return normalizePayload(fallbackPayload);
+}
+
+/**
+ * 从 LLM 输出中解析 JSON 为 ConversationSummaryPayload
+ * <p>
+ * LLM 输出可能包含 Markdown 代码块或多余文本，
+ * 先用 {@link #extractJsonObject} 提取 JSON 对象，再用 Jackson 解析。
+ *
+ * @param raw LLM 原始输出文本
+ * @return 解析后的 payload，失败返回 null
+ */
+private ConversationSummaryPayload parseSummaryPayload(String raw) {
+    if (StrUtil.isBlank(raw)) {
+        return null;
+    }
+    try {
+        // ① 从原始文本中提取 JSON 对象（处理 LLM 输出的 Markdown 包装）
+        JsonNode root = objectMapper.readTree(extractJsonObject(raw));
+        // ② 逐字段映射（用 path 而非 get，字段缺失时返回 null/missing node，不抛异常）
+        ConversationSummaryPayload payload = ConversationSummaryPayload.builder()
+            .summary(root.path("summary").asText(""))
+            .conversationGoal(root.path("conversation_goal").asText(""))
+            .stableFacts(readStringArray(root.path("stable_facts")))
+            .userPreferences(readStringArray(root.path("user_preferences")))
+            .resolvedPoints(readStringArray(root.path("resolved_points")))
+            .pendingQuestions(readStringArray(root.path("pending_questions")))
+            .retrievalHints(readStringArray(root.path("retrieval_hints")))
+            .build();
+        // ③ 规范化：裁剪超长字段 + 去重
+        return normalizePayload(payload);
+    }
+    catch (Exception exception) {
+        // JSON 解析失败（LLM 输出了非法格式）→ 返回 null，调用方会走 fallback
+        log.debug("解析会话长期摘要 JSON 失败: {}", raw, exception);
+        return null;
+    }
+}
 
     private List<String> readStringArray(JsonNode node) {
         if (node == null || !node.isArray()) {
@@ -535,13 +634,20 @@ private SuperAgentChatMemorySummary refreshSummaryIfNecessary(String conversatio
         for (ConversationExchangeView exchange : batch) {
             if (StrUtil.isNotBlank(exchange.getQuestion())) {
                 builder.append("用户：")
-                    .append(clipText(exchange.getQuestion(), MAX_QUESTION_LENGTH))
+                    .append(clipTextAtSentence(exchange.getQuestion(), MAX_QUESTION_LENGTH))
                     .append('\n');
             }
             if (StrUtil.isNotBlank(exchange.getAnswer())) {
-                builder.append("助手：")
-                    .append(clipText(exchange.getAnswer(), MAX_ANSWER_LENGTH))
-                    .append('\n');
+                // FAILED 的回答标注不可靠，LLM 做摘要时应降低权重
+                if (exchange.getStatus() == ChatTurnStatus.FAILED) {
+                    builder.append("助手（本回答生成失败，内容不可靠）：")
+                        .append(clipTextAtSentence(exchange.getAnswer(), MAX_ANSWER_LENGTH))
+                        .append('\n');
+                } else {
+                    builder.append("助手：")
+                        .append(clipTextAtSentence(exchange.getAnswer(), MAX_ANSWER_LENGTH))
+                        .append('\n');
+                }
             }
             if (exchange.getStatus() == ChatTurnStatus.STOPPED && StrUtil.isNotBlank(exchange.getErrorMessage())) {
                 builder.append("补充说明：本轮被停止，说明=")
@@ -552,25 +658,47 @@ private SuperAgentChatMemorySummary refreshSummaryIfNecessary(String conversatio
         return builder.toString().trim();
     }
 
-    private String renderFallbackBatchHighlight(List<ConversationExchangeView> batch) {
-        List<String> highlights = new ArrayList<>();
-        for (ConversationExchangeView exchange : batch) {
-            if (StrUtil.isNotBlank(exchange.getQuestion())) {
-                highlights.add("用户关注：" + clipText(exchange.getQuestion(), MAX_ITEM_LENGTH));
-            }
-            if (StrUtil.isNotBlank(exchange.getAnswer())) {
-                highlights.add("已有结论：" + clipText(exchange.getAnswer(), MAX_ITEM_LENGTH));
-            }
-            if (highlights.size() >= 4) {
-                break;
-            }
+/**
+ * 规则兜底时提取对话批次的要点高亮（不调 LLM，纯文本拼接）
+ * <p>
+ * 遍历本批次的每条 exchange，提取"用户关注"和"已有结论"摘要，
+ * 最多保留 4 条高亮（足够兜底，避免旧摘要无限膨胀）。
+ * 用于 fallbackMerge 中替代 LLM 生成的 summary 字段。
+ */
+private String renderFallbackBatchHighlight(List<ConversationExchangeView> batch) {
+    List<String> highlights = new ArrayList<>();
+    for (ConversationExchangeView exchange : batch) {
+        if (StrUtil.isNotBlank(exchange.getQuestion())) {
+            highlights.add("用户关注：" + clipText(exchange.getQuestion(), MAX_ITEM_LENGTH));
         }
-        return String.join("；", highlights);
+        if (StrUtil.isNotBlank(exchange.getAnswer())) {
+            highlights.add("已有结论：" + clipText(exchange.getAnswer(), MAX_ITEM_LENGTH));
+        }
+        // 最多 4 条（2 对 Q+A），防止旧摘要过度膨胀
+        if (highlights.size() >= 4) {
+            break;
+        }
     }
+    return String.join("；", highlights);
+}
 
+    /**
+     * 渲染近期对话原文 — 注入 LLM Prompt 的"近期窗口"
+     * <p>
+     * 从 exchange 表拉出的轮次列表中，取最近 keepRecentTurns 轮，
+     * 格式化为 "用户：xxx\n助手：xxx\n" 文本，超出字符数上限时从尾部裁剪（保留最新）。
+     * <p>
+     * <b>步骤：</b>过滤 → 截取最近 N 轮 → 逐轮渲染 → 尾部裁剪
+     *
+     * @param exchanges               exchange 表拉取的原始轮次列表
+     * @param keepRecentTurns         保留最近 N 轮（默认 4）
+     * @param recentTranscriptMaxChars 字符数上限（默认 2200），超出从尾部裁剪
+     * @return 格式化的近期对话文本
+     */
     private String renderRecentTranscript(List<ConversationExchangeView> exchanges,
                                           int keepRecentTurns,
                                           int recentTranscriptMaxChars) {
+        // ① 过滤：只保留非 RUNNING 且有内容的轮次
         List<ConversationExchangeView> renderableExchanges = new ArrayList<>();
         for (ConversationExchangeView exchange : exchanges) {
             if (shouldKeepInRecentWindow(exchange)) {
@@ -580,32 +708,66 @@ private SuperAgentChatMemorySummary refreshSummaryIfNecessary(String conversatio
         if (renderableExchanges.isEmpty()) {
             return "";
         }
+        // ② 从后往前截取最近 keepRecentTurns 轮
         int fromIndex = Math.max(0, renderableExchanges.size() - keepRecentTurns);
+        // ③ 逐轮渲染为 "用户：...\n助手：...\n"（question/answer 按句子边界截断）
         StringBuilder builder = new StringBuilder("【最近对话原文】\n");
         for (int index = fromIndex; index < renderableExchanges.size(); index++) {
             ConversationExchangeView exchange = renderableExchanges.get(index);
             if (StrUtil.isNotBlank(exchange.getQuestion())) {
                 builder.append("用户：")
-                    .append(clipText(exchange.getQuestion(), MAX_QUESTION_LENGTH))
+                    .append(clipTextAtSentence(exchange.getQuestion(), MAX_QUESTION_LENGTH))
                     .append('\n');
             }
+            // COMPLETED：正常渲染回答
             if (exchange.getStatus() == ChatTurnStatus.COMPLETED && StrUtil.isNotBlank(exchange.getAnswer())) {
                 builder.append("助手：")
-                    .append(clipText(exchange.getAnswer(), MAX_ANSWER_LENGTH))
+                    .append(clipTextAtSentence(exchange.getAnswer(), MAX_ANSWER_LENGTH))
                     .append('\n');
+            } else if (exchange.getStatus() != ChatTurnStatus.COMPLETED && StrUtil.isNotBlank(exchange.getErrorMessage())) {
+                // FAILED/STOPPED：显式标注状态，让 LLM 知道这轮没有有效回答，防止 Q-A 错位
+                builder.append("（")
+                    .append(exchange.getStatus() == ChatTurnStatus.FAILED ? "本轮回答失败" : "本轮已停止")
+                    .append("，原因：")
+                    .append(clipText(exchange.getErrorMessage(), MAX_ITEM_LENGTH))
+                    .append("）\n");
             }
         }
 
-    // ④ 从尾部裁剪到字符数上限（保留最新内容）
-    return clipRecentTranscript(builder.toString().trim(), recentTranscriptMaxChars);
-}
+        // ④ 从尾部裁剪到字符数上限（保留最新内容，因为越新的对话对 LLM 越重要）
+        return clipRecentTranscript(builder.toString().trim(), recentTranscriptMaxChars);
+    }
 
+    /**
+     * 渲染近期对话（仅用户提问，不含助手回答）
+     * <p>
+     * <b>与 renderRecentTranscript 的核心区别：</b>
+     * <table>
+     *   <tr><td></td><td>renderRecentTranscript</td><td>renderAnswerRecentTranscript</td></tr>
+     *   <tr><td>渲染内容</td><td>用户提问 + 助手回答</td><td>仅用户提问</td></tr>
+     *   <tr><td>用途</td><td>注入 LLM Prompt 作为对话上下文</td><td>判断当前问题是否为追问</td></tr>
+     *   <tr><td>标题</td><td>【最近对话原文】</td><td>【最近相关对话】</td></tr>
+     *   <tr><td>过滤条件</td><td>shouldKeepInRecentWindow（需要 Q 或 A 有值）</td><td>仅需 question 非空</td></tr>
+     *   <tr><td>截断方式</td><td>clipTextAtSentence（按句子边界）</td><td>clipText（固定字数）</td></tr>
+     * </table>
+     * <p>
+     * <b>为什么不渲染助手回答？</b>
+     * 这个方法的产物传给 AnswerHistoryContextAssembler，用于判断"用户刚才问的'那第二个呢？'
+     * 是不是对着上一轮回答的追问"。它只需要知道用户问过什么，不需要助手答过什么。
+     * 只渲染 question 可以省字符数，把预算留给更多轮次。
+     *
+     * @param exchanges       原始轮次列表
+     * @param keepRecentTurns 保留最近 N 轮
+     * @param maxChars        字符数上限
+     * @return 仅含用户提问的格式化文本
+     */
     private String renderAnswerRecentTranscript(List<ConversationExchangeView> exchanges,
                                                 int keepRecentTurns,
                                                 int maxChars) {
         if (exchanges == null || exchanges.isEmpty()) {
             return "";
         }
+        // ① 过滤：非 RUNNING 且有 question（与 shouldKeepInRecentWindow 不同：不要求 answer 有值）
         List<ConversationExchangeView> renderableExchanges = new ArrayList<>();
         for (ConversationExchangeView exchange : exchanges) {
             if (exchange != null
@@ -617,7 +779,9 @@ private SuperAgentChatMemorySummary refreshSummaryIfNecessary(String conversatio
         if (renderableExchanges.isEmpty()) {
             return "";
         }
+        // ② 从后往前截取最近 keepRecentTurns 轮
         int fromIndex = Math.max(0, renderableExchanges.size() - keepRecentTurns);
+        // ③ 逐轮渲染：只渲染 question，不渲染 answer
         StringBuilder builder = new StringBuilder("【最近相关对话】\n");
         for (int index = fromIndex; index < renderableExchanges.size(); index++) {
             ConversationExchangeView exchange = renderableExchanges.get(index);
@@ -626,8 +790,9 @@ private SuperAgentChatMemorySummary refreshSummaryIfNecessary(String conversatio
                     .append(clipText(exchange.getQuestion(), MAX_QUESTION_LENGTH))
                     .append('\n');
             }
-
+            // 注意：这里故意不渲染 answer！追问判断不需要答案内容
         }
+        // ④ 从尾部裁剪到字符数上限
         return clipRecentTranscript(builder.toString().trim(), maxChars);
     }
 
@@ -648,56 +813,83 @@ private SuperAgentChatMemorySummary refreshSummaryIfNecessary(String conversatio
         return joinNonBlank(longTermSummary, recentTranscript, "\n\n").trim();
     }
 
-    private ConversationSummaryPayload normalizePayload(ConversationSummaryPayload payload) {
-        ConversationSummaryPayload workingPayload = payload == null ? ConversationSummaryPayload.builder().build() : payload;
-        String normalizedSummary = clipText(safeText(workingPayload.getSummary()), properties.getHistorySummary().getSummaryMaxChars());
-        if (StrUtil.isBlank(normalizedSummary)) {
-            normalizedSummary = synthesizeSummaryFromSections(workingPayload);
-        }
-        return ConversationSummaryPayload.builder()
-            .summary(normalizedSummary)
-            .conversationGoal(clipText(safeText(workingPayload.getConversationGoal()), MAX_GOAL_LENGTH))
-            .stableFacts(deduplicateAndLimit(workingPayload.getStableFacts()))
-            .userPreferences(deduplicateAndLimit(workingPayload.getUserPreferences()))
-            .resolvedPoints(deduplicateAndLimit(workingPayload.getResolvedPoints()))
-            .pendingQuestions(deduplicateAndLimit(workingPayload.getPendingQuestions()))
-            .retrievalHints(deduplicateAndLimit(workingPayload.getRetrievalHints()))
-            .build();
+/**
+ * 规范化 ConversationSummaryPayload 的每个字段
+ * <p>
+ * 对所有字段做三件事：
+ * <ol>
+ *   <li><b>裁剪</b>：超长字段截断到配置上限（summary→summaryMaxChars，goal→120，其余→80）</li>
+ *   <li><b>去重</b>：列表字段用 LinkedHashSet 去重（保留首次出现顺序）</li>
+ *   <li><b>限数</b>：列表字段最多保留 MAX_SECTION_ITEMS(6) 条</li>
+ * </ol>
+ * <p>
+ * <b>summary 为空时的兜底：</b>
+ * 如果 LLM 返回的 summary 字段为空，用其他非空字段拼接一个：
+ * "目标：xxx；事实：xxx；待跟进：xxx"
+ */
+private ConversationSummaryPayload normalizePayload(ConversationSummaryPayload payload) {
+    ConversationSummaryPayload workingPayload = payload == null ? ConversationSummaryPayload.builder().build() : payload;
+    // summary 超长截断；为空时从其他字段合成
+    String normalizedSummary = clipText(safeText(workingPayload.getSummary()), properties.getHistorySummary().getSummaryMaxChars());
+    if (StrUtil.isBlank(normalizedSummary)) {
+        normalizedSummary = synthesizeSummaryFromSections(workingPayload);
     }
+    // 重建对象：每个字段都经过 裁剪 + 去重 + 限数
+    return ConversationSummaryPayload.builder()
+        .summary(normalizedSummary)
+        .conversationGoal(clipText(safeText(workingPayload.getConversationGoal()), MAX_GOAL_LENGTH))
+        .stableFacts(deduplicateAndLimit(workingPayload.getStableFacts()))
+        .userPreferences(deduplicateAndLimit(workingPayload.getUserPreferences()))
+        .resolvedPoints(deduplicateAndLimit(workingPayload.getResolvedPoints()))
+        .pendingQuestions(deduplicateAndLimit(workingPayload.getPendingQuestions()))
+        .retrievalHints(deduplicateAndLimit(workingPayload.getRetrievalHints()))
+        .build();
+}
 
-    private String synthesizeSummaryFromSections(ConversationSummaryPayload payload) {
-        List<String> parts = new ArrayList<>();
-        if (StrUtil.isNotBlank(payload.getConversationGoal())) {
-            parts.add("目标：" + clipText(payload.getConversationGoal(), MAX_ITEM_LENGTH));
-        }
-        if (!safeList(payload.getStableFacts()).isEmpty()) {
-            parts.add("事实：" + String.join("；", safeList(payload.getStableFacts())));
-        }
-        if (!safeList(payload.getPendingQuestions()).isEmpty()) {
-            parts.add("待跟进：" + String.join("；", safeList(payload.getPendingQuestions())));
-        }
-        return clipText(String.join("；", parts), properties.getHistorySummary().getSummaryMaxChars());
+/**
+ * summary 为空时的兜底：从其他结构化字段拼出一个摘要文本
+ * <p>
+ * 格式："目标：xxx；事实：xxx；待跟进：xxx"
+ */
+private String synthesizeSummaryFromSections(ConversationSummaryPayload payload) {
+    List<String> parts = new ArrayList<>();
+    if (StrUtil.isNotBlank(payload.getConversationGoal())) {
+        parts.add("目标：" + clipText(payload.getConversationGoal(), MAX_ITEM_LENGTH));
     }
-
-    private List<String> deduplicateAndLimit(List<String> values) {
-        LinkedHashSet<String> deduplicated = new LinkedHashSet<>();
-        for (String value : safeList(values)) {
-            String text = clipText(safeText(value), MAX_ITEM_LENGTH);
-            if (StrUtil.isNotBlank(text)) {
-                deduplicated.add(text);
-            }
-            if (deduplicated.size() >= MAX_SECTION_ITEMS) {
-                break;
-            }
-        }
-        return new ArrayList<>(deduplicated);
+    if (!safeList(payload.getStableFacts()).isEmpty()) {
+        parts.add("事实：" + String.join("；", safeList(payload.getStableFacts())));
     }
+    if (!safeList(payload.getPendingQuestions()).isEmpty()) {
+        parts.add("待跟进：" + String.join("；", safeList(payload.getPendingQuestions())));
+    }
+    return clipText(String.join("；", parts), properties.getHistorySummary().getSummaryMaxChars());
+}
 
-    private ConversationSummaryPayload copyPayload(ConversationSummaryPayload payload) {
-        if (payload == null) {
-            return ConversationSummaryPayload.builder().build();
+/**
+ * 去重 + 限数：LinkedHashSet 去重，每条裁剪到 MAX_ITEM_LENGTH(80)，最多 MAX_SECTION_ITEMS(6) 条
+ */
+private List<String> deduplicateAndLimit(List<String> values) {
+    LinkedHashSet<String> deduplicated = new LinkedHashSet<>();  // 保留插入顺序的去重集合
+    for (String value : safeList(values)) {
+        String text = clipText(safeText(value), MAX_ITEM_LENGTH);  // 每条裁剪到 80 字
+        if (StrUtil.isNotBlank(text)) {
+            deduplicated.add(text);
         }
-        return ConversationSummaryPayload.builder()
+        if (deduplicated.size() >= MAX_SECTION_ITEMS) {  // 最多 6 条
+            break;
+        }
+    }
+    return new ArrayList<>(deduplicated);
+}
+
+/**
+ * 深拷贝 ConversationSummaryPayload（避免修改传入的原对象）
+ */
+private ConversationSummaryPayload copyPayload(ConversationSummaryPayload payload) {
+    if (payload == null) {
+        return ConversationSummaryPayload.builder().build();
+    }
+    return ConversationSummaryPayload.builder()
             .summary(payload.getSummary())
             .conversationGoal(payload.getConversationGoal())
             .stableFacts(new ArrayList<>(safeList(payload.getStableFacts())))
@@ -777,6 +969,29 @@ private SuperAgentChatMemorySummary refreshSummaryIfNecessary(String conversatio
             return normalized;
         }
         return normalized.substring(0, Math.max(0, maxChars - 1)) + "…";
+    }
+
+    /**
+     * 按句子边界截断，避免在词语/句子中间切断
+     * <p>
+     * 在 maxChars 范围内向前查找最后一个句子结束标记（。！？\n；;），
+     * 找到则截断到该位置 + "…"，找不到则退化为 {@link #clipText}。
+     */
+    private String clipTextAtSentence(String text, int maxChars) {
+        String normalized = safeText(text);
+        if (normalized.length() <= maxChars) {
+            return normalized;
+        }
+        // 在 maxChars 范围内向前搜索句子边界（最多回溯 40 字）
+        int cutPoint = Math.max(0, maxChars - 1);
+        for (int i = cutPoint; i >= Math.max(0, maxChars - 40); i--) {
+            char c = normalized.charAt(i);
+            if (c == '。' || c == '！' || c == '？' || c == '\n' || c == '；' || c == ';') {
+                return normalized.substring(0, i + 1) + "…";
+            }
+        }
+        // 找不到句子边界，退化为原 clipText（保证不超长）
+        return clipText(normalized, maxChars);
     }
 
     private String clipRecentTranscript(String text, int maxChars) {
