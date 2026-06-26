@@ -37,11 +37,27 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * @program: 企业级别深度设计 AI Agent。添加 阿星不是程序员 微信，添加时备注 super 来获取项目的完整资料
- * @description: 服务层
- * @author: 阿星不是程序员
- **/
-
+ * 持久化会话记忆服务 — 对话长期记忆的管理者
+ * <p>
+ * 核心职责：
+ * <ol>
+ *   <li><b>加载记忆上下文</b>（{@link #loadMemoryContext}）：
+ *       从 memory_summary 表读取长期摘要 + 从 exchange 表读取近期窗口 → 组装 ConversationMemoryContext</li>
+ *   <li><b>触发记忆压缩</b>（{@link #refreshSummaryIfNecessary}）：
+ *       当未压缩轮次超过 keepRecentTurns 时，调用 LLM 将溢出轮次压缩为长期摘要</li>
+ *   <li><b>异步刷新</b>（{@link #refreshConversationSummaryAsync}）：
+ *       每次对话收尾后异步触发压缩检查</li>
+ * </ol>
+ * <p>
+ * <b>数据流：</b>
+ * <pre>
+ * exchange 表（所有轮次）
+ *   ├─ coveredExchangeId 之前 → 已压缩到 memory_summary.longTermSummary
+ *   └─ coveredExchangeId 之后 → 未被压缩，作为 recentTranscript 直接读取
+ * </pre>
+ *
+ * @author 阿星不是程序员
+ */
 @Slf4j
 @Service
 public class PersistentConversationMemoryService implements ConversationMemoryService {
@@ -88,74 +104,115 @@ public class PersistentConversationMemoryService implements ConversationMemorySe
         return loadMemoryContext(conversationId, null);
     }
 
-    @Override
-    public ConversationMemoryContext loadMemoryContext(String conversationId, ConversationTraceRecorder traceRecorder) {
-        if (StrUtil.isBlank(conversationId)) {
-            return emptyContext();
-        }
+/**
+ * 加载会话记忆上下文
+ * <p>
+ * <b>这是 prepare 阶段调用的入口，返回编排器需要的完整记忆数据。</b>
+ * <p>
+ * <b>两种模式：</b>
+ * <ol>
+ *   <li><b>压缩关闭</b>（historySummary.enabled=false）：
+ *       直接从 exchange 表读最近 N 轮原文，不查 memory_summary 表</li>
+ *   <li><b>压缩开启</b>（默认）：
+ *       ① 查 memory_summary 表 → 长期摘要
+ *       ② 查 exchange 表 → 近期未压缩的窗口
+ *       ③ 如果未压缩轮次溢出 → 触发 LLM 压缩（本方法内同步完成）</li>
+ * </ol>
+ * <p>
+ * <b>压缩触发条件：</b>
+ * "未被长期摘要覆盖的已完成轮次" > keepRecentTurns（默认 4）
+ * <p>
+ * <b>压缩产出：</b>
+ * ConversationSummaryPayload（LLM 生成的结构化摘要）→ 写入 memory_summary 表
+ *
+ * @param conversationId 会话 ID
+ * @param traceRecorder  追踪记录器（可 null）
+ * @return 组装好的 ConversationMemoryContext
+ */
+@Override
+public ConversationMemoryContext loadMemoryContext(String conversationId, ConversationTraceRecorder traceRecorder) {
+    // ── conversationId 为空 → 返回空上下文（新会话首次对话）──
+    if (StrUtil.isBlank(conversationId)) {
+        return emptyContext();
+    }
 
-        ChatRagProperties.HistorySummaryProperties historySummaryProperties = properties.getHistorySummary();
-        if (!historySummaryProperties.isEnabled()) {
+    ChatRagProperties.HistorySummaryProperties historySummaryProperties = properties.getHistorySummary();
 
-            String recentTranscript = renderRecentTranscript(
-                conversationArchiveStore.listRecentExchanges(conversationId, Math.max(1, properties.getRewriteHistoryTurns() * 3)),
-                Math.max(1, properties.getRewriteHistoryTurns()),
-                historySummaryProperties.getRecentTranscriptMaxChars()
-            );
-            String answerRecentTranscript = renderAnswerRecentTranscript(
-                conversationArchiveStore.listRecentExchanges(conversationId, Math.max(1, properties.getRewriteHistoryTurns() * 3)),
-                Math.max(1, properties.getRewriteHistoryTurns()),
-                Math.max(1, properties.getAnswerHistoryMaxChars())
-            );
-            return ConversationMemoryContext.builder()
-                .assembledHistory(recentTranscript)
-                .longTermSummary("")
-                .recentTranscript(recentTranscript)
-                .answerRecentTranscript(answerRecentTranscript)
-                .summaryPayload(ConversationSummaryPayload.builder().build())
-                .coveredExchangeId(0L)
-                .coveredExchangeCount(0)
-                .compressionCount(0)
-                .compressionApplied(false)
-                .build();
-        }
-
-        SuperAgentChatMemorySummary summaryState = refreshSummaryIfNecessary(
-            conversationId,
-            findSummary(conversationId).orElse(null),
-            traceRecorder
-        );
-        ConversationSummaryPayload summaryPayload = readSummaryPayload(summaryState);
-
-        List<ConversationExchangeView> recentExchanges = conversationArchiveStore.listRecentExchanges(
-            conversationId,
-            recentFetchLimit(historySummaryProperties.getKeepRecentTurns())
-        );
+    // ══════════════════════════════════════════════════════════
+    // 路径 A：压缩功能关闭 → 只读近期窗口，不查 memory_summary
+    // ══════════════════════════════════════════════════════════
+    if (!historySummaryProperties.isEnabled()) {
+        // 从 exchange 表拉取最近几轮原文（多拉一些防止过滤后不够）
         String recentTranscript = renderRecentTranscript(
-            recentExchanges,
-            historySummaryProperties.getKeepRecentTurns(),
+            conversationArchiveStore.listRecentExchanges(conversationId, Math.max(1, properties.getRewriteHistoryTurns() * 3)),
+            Math.max(1, properties.getRewriteHistoryTurns()),
             historySummaryProperties.getRecentTranscriptMaxChars()
         );
         String answerRecentTranscript = renderAnswerRecentTranscript(
-            recentExchanges,
-            historySummaryProperties.getKeepRecentTurns(),
+            conversationArchiveStore.listRecentExchanges(conversationId, Math.max(1, properties.getRewriteHistoryTurns() * 3)),
+            Math.max(1, properties.getRewriteHistoryTurns()),
             Math.max(1, properties.getAnswerHistoryMaxChars())
         );
-        String longTermSummary = summaryState == null ? "" : safeText(summaryState.getSummaryText());
-
         return ConversationMemoryContext.builder()
-
-            .assembledHistory(assembleHistory(longTermSummary, recentTranscript))
-            .longTermSummary(longTermSummary)
+            .assembledHistory(recentTranscript)
+            .longTermSummary("")           // 无长期摘要
             .recentTranscript(recentTranscript)
             .answerRecentTranscript(answerRecentTranscript)
-            .summaryPayload(summaryPayload)
-            .coveredExchangeId(summaryState == null ? 0L : defaultLong(summaryState.getCoveredExchangeId()))
-            .coveredExchangeCount(summaryState == null ? 0 : safeInt(summaryState.getCoveredExchangeCount()))
-            .compressionCount(summaryState == null ? 0 : safeInt(summaryState.getCompressionCount()))
-            .compressionApplied(StrUtil.isNotBlank(longTermSummary))
+            .summaryPayload(ConversationSummaryPayload.builder().build())  // 空结构
+            .coveredExchangeId(0L)         // 无覆盖
+            .coveredExchangeCount(0)
+            .compressionCount(0)
+            .compressionApplied(false)
             .build();
     }
+
+    // ══════════════════════════════════════════════════════════
+    // 路径 B：压缩功能开启 → 查 memory_summary + 按需触发压缩
+    // ══════════════════════════════════════════════════════════
+
+    // ① 查 memory_summary 表 + 按需触发压缩（可能同步阻塞调 LLM）
+    SuperAgentChatMemorySummary summaryState = refreshSummaryIfNecessary(
+        conversationId,
+        findSummary(conversationId).orElse(null),  // 查 DB 中现有的摘要记录
+        traceRecorder
+    );
+    // ② 将 summary_json 反序列化为结构化对象
+    ConversationSummaryPayload summaryPayload = readSummaryPayload(summaryState);
+
+    // ③ 从 exchange 表拉取近期轮次（未被压缩覆盖的窗口）
+    List<ConversationExchangeView> recentExchanges = conversationArchiveStore.listRecentExchanges(
+        conversationId,
+        recentFetchLimit(historySummaryProperties.getKeepRecentTurns())  // 多拉一点防止过滤后不够
+    );
+    // ④ 渲染近期对话原文（给 LLM 看的）
+    String recentTranscript = renderRecentTranscript(
+        recentExchanges,
+        historySummaryProperties.getKeepRecentTurns(),
+        historySummaryProperties.getRecentTranscriptMaxChars()
+    );
+    // ⑤ 渲染近期助手回答（用于追问判断）
+    String answerRecentTranscript = renderAnswerRecentTranscript(
+        recentExchanges,
+        historySummaryProperties.getKeepRecentTurns(),
+        Math.max(1, properties.getAnswerHistoryMaxChars())
+    );
+    // ⑥ 提取 longTermSummary 文本
+    String longTermSummary = summaryState == null ? "" : safeText(summaryState.getSummaryText());
+
+    // ⑦ 组装返回
+    return ConversationMemoryContext.builder()
+        // 拼接好的完整历史（长期摘要 + 近期窗口）
+        .assembledHistory(assembleHistory(longTermSummary, recentTranscript))
+        .longTermSummary(longTermSummary)
+        .recentTranscript(recentTranscript)
+        .answerRecentTranscript(answerRecentTranscript)
+        .summaryPayload(summaryPayload)
+        .coveredExchangeId(summaryState == null ? 0L : defaultLong(summaryState.getCoveredExchangeId()))
+        .coveredExchangeCount(summaryState == null ? 0 : safeInt(summaryState.getCoveredExchangeCount()))
+        .compressionCount(summaryState == null ? 0 : safeInt(summaryState.getCompressionCount()))
+        .compressionApplied(StrUtil.isNotBlank(longTermSummary))  // 有摘要文本 = 压缩已应用
+        .build();
+}
 
     @Override
     public void refreshConversationSummaryAsync(String conversationId) {
@@ -216,44 +273,83 @@ public class PersistentConversationMemoryService implements ConversationMemorySe
             .eq(SuperAgentChatMemorySummary::getConversationId, conversationId));
     }
 
-    private SuperAgentChatMemorySummary refreshSummaryIfNecessary(String conversationId,
-                                                                  SuperAgentChatMemorySummary currentState,
-                                                                  ConversationTraceRecorder traceRecorder) {
-        ChatRagProperties.HistorySummaryProperties historySummaryProperties = properties.getHistorySummary();
-        long coveredExchangeId = currentState == null ? 0L : defaultLong(currentState.getCoveredExchangeId());
+/**
+ * 按需刷新会话长期摘要（ID 为 exchangeId）
+ * <p>
+ * <b>核心逻辑：</b>
+ * <ol>
+ *   <li>查 exchange 表：coveredExchangeId 之后有哪些新轮次</li>
+ *   <li>筛选出"稳定轮次"（COMPLETED + 有 question）</li>
+ *   <li>如果稳定轮次 > keepRecentTurns → 有溢出 → 需要压缩</li>
+ *   <li>将溢出轮次按 batch 分批，每批调 LLM 生成/合并摘要</li>
+ *   <li>每批压缩后写入 memory_summary 表（saveSummarySnapshot）</li>
+ * </ol>
+ * <p>
+ * <b>示例：</b>
+ * <pre>
+ * keepRecentTurns=4, compressionBatchTurns=6
+ * 如果有 10 个稳定轮次
+ *   溢出 = 10 - 4 = 6 个轮次
+ *   分 1 批（6 个）→ 调 LLM 压缩 → 写入 memory_summary
+ *   更新 coveredExchangeId，下次从新的位置开始
+ * </pre>
+ *
+ * @param conversationId 会话 ID
+ * @param currentState   当前 memory_summary 记录（可能为 null）
+ * @param traceRecorder  追踪记录器
+ * @return 最新的 memory_summary 记录
+ */
+private SuperAgentChatMemorySummary refreshSummaryIfNecessary(String conversationId,
+                                                              SuperAgentChatMemorySummary currentState,
+                                                              ConversationTraceRecorder traceRecorder) {
+    ChatRagProperties.HistorySummaryProperties historySummaryProperties = properties.getHistorySummary();
+    // 当前已覆盖到的 exchangeId（=0 表示从未压缩过）
+    long coveredExchangeId = currentState == null ? 0L : defaultLong(currentState.getCoveredExchangeId());
 
-        List<ConversationExchangeView> incrementalExchanges = conversationArchiveStore.listExchangesAfter(
-            conversationId,
-            coveredExchangeId
-        );
-        List<ConversationExchangeView> stableExchanges = incrementalExchanges.stream()
-            .filter(this::isStableSummaryExchange)
-            .toList();
+    // ① 从 exchange 表拉取 coveredExchangeId 之后的所有轮次（增量）
+    List<ConversationExchangeView> incrementalExchanges = conversationArchiveStore.listExchangesAfter(
+        conversationId,
+        coveredExchangeId
+    );
+    // ② 筛选"稳定轮次"：COMPLETED + 有 question（RUNNING/FAILED/STOPPED 的不参与压缩）
+    List<ConversationExchangeView> stableExchanges = incrementalExchanges.stream()
+        .filter(this::isStableSummaryExchange)
+        .toList();
 
-        int overflowCount = Math.max(0, stableExchanges.size() - historySummaryProperties.getKeepRecentTurns());
-        if (overflowCount <= 0) {
-            return currentState;
-        }
-
-        List<ConversationExchangeView> overflowExchanges = stableExchanges.subList(0, overflowCount);
-        SuperAgentChatMemorySummary workingState = currentState;
-
-        for (int start = 0; start < overflowExchanges.size(); start += historySummaryProperties.getCompressionBatchTurns()) {
-            int end = Math.min(start + historySummaryProperties.getCompressionBatchTurns(), overflowExchanges.size());
-            List<ConversationExchangeView> batch = overflowExchanges.subList(start, end);
-            ConversationSummaryPayload mergedPayload = mergeSummaryPayload(readSummaryPayload(workingState), batch, traceRecorder);
-            ConversationExchangeView lastExchange = batch.get(batch.size() - 1);
-            workingState = saveSummarySnapshot(
-                conversationId,
-                workingState,
-                mergedPayload,
-                lastExchange.getExchangeId(),
-                safeInt(workingState == null ? null : workingState.getCoveredExchangeCount()) + batch.size(),
-                resolveSourceTime(lastExchange)
-            );
-        }
-        return workingState;
+    // ③ 计算溢出数量 = 稳定轮次 - 保留阈值
+    int overflowCount = Math.max(0, stableExchanges.size() - historySummaryProperties.getKeepRecentTurns());
+    if (overflowCount <= 0) {
+        // 没溢出 → 不需要压缩，直接返回现有状态
+        return currentState;
     }
+
+    // ④ 有溢出 → 取出最旧的溢出轮次（保留最新的 keepRecentTurns 个）
+    List<ConversationExchangeView> overflowExchanges = stableExchanges.subList(0, overflowCount);
+    SuperAgentChatMemorySummary workingState = currentState;
+
+    // ⑤ 按 batch 大小分批压缩（每批调一次 LLM）
+    for (int start = 0; start < overflowExchanges.size(); start += historySummaryProperties.getCompressionBatchTurns()) {
+        int end = Math.min(start + historySummaryProperties.getCompressionBatchTurns(), overflowExchanges.size());
+        List<ConversationExchangeView> batch = overflowExchanges.subList(start, end);
+
+        // 调 LLM 合并已有的 summary + 新的 batch 对话 → 新的 structured summary
+        ConversationSummaryPayload mergedPayload = mergeSummaryPayload(readSummaryPayload(workingState), batch, traceRecorder);
+
+        // 取本批最后一条 exchange，作为新的 coveredExchangeId
+        ConversationExchangeView lastExchange = batch.get(batch.size() - 1);
+
+        // 写入 memory_summary 表（INSERT 或 UPDATE）
+        workingState = saveSummarySnapshot(
+            conversationId,
+            workingState,
+            mergedPayload,
+            lastExchange.getExchangeId(),                                                      // 更新 coveredExchangeId
+            safeInt(workingState == null ? null : workingState.getCoveredExchangeCount()) + batch.size(),  // 累加覆盖数
+            resolveSourceTime(lastExchange)
+        );
+    }
+    return workingState;
+}
 
     private ConversationSummaryPayload mergeSummaryPayload(ConversationSummaryPayload existingPayload,
                                                            List<ConversationExchangeView> batch,
@@ -500,8 +596,9 @@ public class PersistentConversationMemoryService implements ConversationMemorySe
             }
         }
 
-        return clipRecentTranscript(builder.toString().trim(), recentTranscriptMaxChars);
-    }
+    // ④ 从尾部裁剪到字符数上限（保留最新内容）
+    return clipRecentTranscript(builder.toString().trim(), recentTranscriptMaxChars);
+}
 
     private String renderAnswerRecentTranscript(List<ConversationExchangeView> exchanges,
                                                 int keepRecentTurns,
