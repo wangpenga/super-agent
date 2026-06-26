@@ -81,7 +81,7 @@ public class DocumentManageProperties {
 
         private Boolean enabled = Boolean.TRUE;
 
-        private String host = "127.0.0.1";
+        private String host = "localhost";
 
         private Integer port = 5432;
 
