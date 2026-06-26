@@ -95,9 +95,13 @@ public class DocumentManageProperties {
 
         private String poolName = "super-agent-manage-pgvector-hikari";
 
-        private Integer maximumPoolSize = 5;
+        private Integer maximumPoolSize = 15;
 
-        private Integer minimumIdle = 1;
+        private Integer minimumIdle = 5;
+
+        private Integer connectionTimeout = 10000;
+
+        private Integer leakDetectionThreshold = 60000;
     }
 
     @Data

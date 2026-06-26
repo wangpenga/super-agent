@@ -32,6 +32,10 @@ public class DocumentManagePgVectorConfiguration {
         dataSource.setPoolName(pg.getPoolName());
         dataSource.setMaximumPoolSize(pg.getMaximumPoolSize());
         dataSource.setMinimumIdle(pg.getMinimumIdle());
+        dataSource.setConnectionTimeout(pg.getConnectionTimeout());
+        if (pg.getLeakDetectionThreshold() != null && pg.getLeakDetectionThreshold() > 0) {
+            dataSource.setLeakDetectionThreshold(pg.getLeakDetectionThreshold());
+        }
         return new DocumentManagePgVectorJdbcSupport(dataSource);
     }
 
