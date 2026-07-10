@@ -21,7 +21,7 @@ import java.util.Date;
  * 一个文档可以有多个方案版本（通过 plan_version 区分），当前生效的方案记录在
  * SuperAgentDocument.currentPlanId 中。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

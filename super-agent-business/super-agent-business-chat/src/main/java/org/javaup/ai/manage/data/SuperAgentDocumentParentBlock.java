@@ -18,7 +18,7 @@ import org.javaup.database.data.BaseTableData;
  * <p>
  * 在 RAG 检索中，当子块被匹配时，可以通过父块获取更完整的上下文（父子块提升策略）。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

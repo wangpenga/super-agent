@@ -16,7 +16,7 @@ import lombok.NoArgsConstructor;
  * {@link #uniqueKey()} 方法根据来源类型生成去重键，
  * 用于在最终展示给用户前对引用列表做去重。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

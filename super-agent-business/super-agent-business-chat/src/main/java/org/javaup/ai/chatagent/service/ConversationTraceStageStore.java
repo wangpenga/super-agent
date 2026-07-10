@@ -9,7 +9,7 @@ import java.util.List;
 /**
  * 阶段轨迹存储接口 —— 操作 super_agent_chat_exchange_trace_stage 表
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 public interface ConversationTraceStageStore {
 

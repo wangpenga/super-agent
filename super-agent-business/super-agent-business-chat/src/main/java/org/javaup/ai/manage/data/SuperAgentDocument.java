@@ -19,7 +19,7 @@ import org.javaup.database.data.BaseTableData;
  * 一个文档经过 上传 → 解析 → 策略推荐 → 索引构建 的完整生命周期，
  * 最终产生可用于 RAG 检索的结构节点、父块和切块数据。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

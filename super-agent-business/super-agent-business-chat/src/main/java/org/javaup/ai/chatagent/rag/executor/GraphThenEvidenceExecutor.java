@@ -60,9 +60,9 @@ import java.util.Map;
  * <b>关键词提取（extractItemKeyword）：</b>
  * 从问题中提取 "哪一步" / "哪一项" 后面的关键词，用于在章节内容中匹配具体的编号项。
  *
- * @program: 企业级别深度设计 AI Agent。添加 阿星不是程序员 微信，添加时备注 super 来获取项目的完整资料
+ * @program: 企业级别深度设计 AI Agent。添加 wangpeng 微信，添加时备注 super 来获取项目的完整资料
  * @description: 结构图定位+证据校验执行器 - 精确定位文档章节/编号项并校验证据
- * @author: 阿星不是程序员
+ * @author: wangpeng
  **/
 @Component
 @Slf4j

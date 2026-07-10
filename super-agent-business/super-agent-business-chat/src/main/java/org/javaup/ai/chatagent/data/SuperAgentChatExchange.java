@@ -17,7 +17,7 @@ import org.javaup.database.data.BaseTableData;
  * 引用来源、推荐追问、工具调用轨迹、调试信息、执行状态和耗时指标。
  * 一轮对话 = 一次用户提问 + 一次 AI 回答。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

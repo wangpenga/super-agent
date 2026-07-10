@@ -56,9 +56,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <b>下游链路：</b>
  * 本执行器产生的文本块 → buildConversationExecution 的 doOnNext → emitModelChunk → SSE Sink → 客户端
  *
- * @program: 企业级别深度设计 AI Agent。添加 阿星不是程序员 微信，添加时备注 super 来获取项目的完整资料
+ * @program: 企业级别深度设计 AI Agent。添加 wangpeng 微信，添加时备注 super 来获取项目的完整资料
  * @description: ReactAgent 执行器 - 处理 OPEN_CHAT 模式，由 Agent 自主推理和工具调用
- * @author: 阿星不是程序员
+ * @author: wangpeng
  **/
 @Component
 public class ReactAgentExecutor implements ConversationExecutor {

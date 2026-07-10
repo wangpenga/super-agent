@@ -23,7 +23,7 @@ import org.javaup.database.data.BaseTableData;
  *   <li>RAG 检索：通过 structure_node_id 关联切块和父块，实现结构感知检索</li>
  * </ul>
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

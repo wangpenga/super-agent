@@ -12,7 +12,7 @@ import java.time.Instant;
  * <p>
  * 记录单个检索结果从召回到最终选入 Prompt 的全链路排名和分数变化。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

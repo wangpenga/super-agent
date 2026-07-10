@@ -12,7 +12,7 @@ import java.time.Instant;
  * <p>
  * 记录每个检索通道在每个子问题上的执行效果，用于分析通道性能。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

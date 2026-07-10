@@ -12,7 +12,7 @@ import org.springframework.stereotype.Component;
  * 控制整个 RAG 管道的所有参数：从检索阶段的 topK/阈值/超时，
  * 到改写阶段的温度参数，到证据预算的字数限制，到补全提示词。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @Component

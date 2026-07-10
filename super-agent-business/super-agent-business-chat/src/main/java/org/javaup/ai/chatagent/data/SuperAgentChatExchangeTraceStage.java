@@ -22,7 +22,7 @@ import java.util.Date;
  * RAG_RETRIEVE（混合检索）、EVIDENCE_BUDGET（证据预算组装）、
  * ANSWER_GENERATE（答案生成）、REACT_AGENT（Agent 执行）、FINALIZE（收尾）。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

@@ -17,7 +17,7 @@ import java.time.LocalDateTime;
  * <p>
  * 与 GRAPH_THREAD 表配合使用，实现对话状态的持久化和断点续传。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

@@ -11,7 +11,7 @@ import lombok.NoArgsConstructor;
  * 记录 LLM 调用次数和工具调用次数的上限及实际用量，
  * 用于防止单轮对话无限循环消耗资源。最终写入 exchange.debugTraceJson。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @Builder

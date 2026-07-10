@@ -56,7 +56,7 @@ import java.util.regex.Pattern;
  *   └─ coveredExchangeId 之后 → 未被压缩，作为 recentTranscript 直接读取
  * </pre>
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Slf4j
 @Service

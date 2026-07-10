@@ -18,7 +18,7 @@ import org.javaup.database.data.BaseTableData;
  * 步骤按策略类型（基于文档结构切块/递归分块/语义分块/大模型智能切块）和
  * 策略角色（主策略/优化策略/兜底策略/增强策略）组织执行，最终产出文档的父块和切块。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

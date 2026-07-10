@@ -63,9 +63,9 @@ import java.util.Map;
  * 这个文本会根据问题类型动态生成（能力问询、开放式问题、一般无证据），
  * 引导用户切换到合适的模式或补充更具体的信息。
  *
- * @program: 企业级别深度设计 AI Agent。添加 阿星不是程序员 微信，添加时备注 super 来获取项目的完整资料
+ * @program: 企业级别深度设计 AI Agent。添加 wangpeng 微信，添加时备注 super 来获取项目的完整资料
  * @description: RAG 知识问答执行器 - 双通道检索 + Prompt 预算组装 + LLM 流式生成
- * @author: 阿星不是程序员
+ * @author: wangpeng
  **/
 @Component
 public class RagChatExecutor implements ConversationExecutor {

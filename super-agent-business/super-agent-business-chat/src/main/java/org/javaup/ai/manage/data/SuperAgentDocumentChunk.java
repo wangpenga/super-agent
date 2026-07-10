@@ -18,7 +18,7 @@ import org.javaup.database.data.BaseTableData;
  * 切块是 RAG 检索的最小单元，每个 chunk 会被向量化后存入 PGVector/Milvus/ES 等向量库，
  * 用于语义相似度检索。结构节点信息（structure_node_id, section_path）用于关联文档结构图。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

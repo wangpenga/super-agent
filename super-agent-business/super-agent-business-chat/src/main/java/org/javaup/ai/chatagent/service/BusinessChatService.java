@@ -105,9 +105,9 @@ import java.util.concurrent.ConcurrentHashMap;
  *                  │ .doOnCancel → stopTask(taskInfo, "客户端已取消请求")
  * </pre>
  *
- * @program: 企业级别深度设计 AI Agent。添加 阿星不是程序员 微信，添加时备注 super 来获取项目的完整资料
+ * @program: 企业级别深度设计 AI Agent。添加 wangpeng 微信，添加时备注 super 来获取项目的完整资料
  * @description: 服务层 - 流式聊天核心编排协调器
- * @author: 阿星不是程序员
+ * @author: wangpeng
  **/
 
 @Slf4j

@@ -22,7 +22,7 @@ import lombok.NoArgsConstructor;
  *   <li>近期对话窗口来自 {@code super_agent_chat_exchange} 表（最近几轮问答）</li>
  * </ul>
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @Builder

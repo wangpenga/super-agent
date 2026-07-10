@@ -16,7 +16,7 @@ import org.javaup.database.data.BaseTableData;
  * 记录每个对话会话的元信息，包括会话模式、锁定的文档范围等。
  * 一个会话 (dialogue) 包含多个轮次 (exchange)。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

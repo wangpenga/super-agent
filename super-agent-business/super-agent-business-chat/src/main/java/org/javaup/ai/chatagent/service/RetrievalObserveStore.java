@@ -12,7 +12,7 @@ import java.util.List;
  *   <li><b>super_agent_chat_channel_execution</b>：检索通道执行详情</li>
  * </ul>
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 public interface RetrievalObserveStore {
 

@@ -16,7 +16,7 @@ import lombok.NoArgsConstructor;
  * <p>
  * is_released 标记用于指示该线程是否已被释放（会话结束或重置时设置）。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

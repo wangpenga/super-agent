@@ -22,7 +22,7 @@ import java.util.Date;
  * <p>
  * 用于分析各检索通道的性能和效果。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

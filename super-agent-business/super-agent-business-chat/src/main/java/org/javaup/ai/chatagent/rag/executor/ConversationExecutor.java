@@ -22,9 +22,9 @@ import reactor.core.publisher.Flux;
  * 由 {@link ConversationExecutorRegistry} 按 ExecutionMode 查找对应实现，
  * 在 {@code BusinessChatService.buildConversationExecution} 中调用。
  *
- * @program: 企业级别深度设计 AI Agent。添加 阿星不是程序员 微信，添加时备注 super 来获取项目的完整资料
+ * @program: 企业级别深度设计 AI Agent。添加 wangpeng 微信，添加时备注 super 来获取项目的完整资料
  * @description: 统一对话执行器抽象 - 策略模式，按 ExecutionMode 选择执行路径
- * @author: 阿星不是程序员
+ * @author: wangpeng
  **/
 public interface ConversationExecutor {
 

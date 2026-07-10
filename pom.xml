@@ -18,6 +18,7 @@
         <module>super-agent-common</module>
         <module>super-agent-id-generator-framework</module>
         <module>super-agent-redisson-framework</module>
+        <module>super-agent-eval</module>
     </modules>
     
     <properties>
@@ -155,7 +156,7 @@
 
     <developers>
         <developer>
-            <name>阿星不是程序员</name>
+            <name>wangpeng</name>
             <email>1031900093@qq.com</email>
         </developer>
     </developers>

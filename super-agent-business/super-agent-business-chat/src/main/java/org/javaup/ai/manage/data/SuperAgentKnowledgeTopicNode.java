@@ -22,7 +22,7 @@ import org.javaup.database.data.BaseTableData;
  * </ul>
  * 这些配置帮助路由决策层选择最优的执行路径。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

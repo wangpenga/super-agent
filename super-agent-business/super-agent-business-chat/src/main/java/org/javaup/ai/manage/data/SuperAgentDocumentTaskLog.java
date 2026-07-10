@@ -17,7 +17,7 @@ import org.javaup.database.data.BaseTableData;
  * <p>
  * 用于追踪文档从上传到入库完成的完整处理过程，便于问题排查和审计。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

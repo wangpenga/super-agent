@@ -18,7 +18,7 @@ import org.javaup.database.data.BaseTableData;
  * <p>
  * 典型的知识范围：OA系统 / CRM系统 / 财务系统 / 技术文档 等。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

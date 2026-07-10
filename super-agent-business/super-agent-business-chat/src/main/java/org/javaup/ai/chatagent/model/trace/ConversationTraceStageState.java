@@ -3,7 +3,7 @@ package org.javaup.ai.chatagent.model.trace;
 /**
  * 阶段执行状态 —— 写入 trace_stage.stage_state
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 public enum ConversationTraceStageState {
 

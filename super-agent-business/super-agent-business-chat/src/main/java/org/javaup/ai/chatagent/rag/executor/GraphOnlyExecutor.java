@@ -44,9 +44,9 @@ import java.util.Map;
  * <p>
  * <b>不调用 LLM：</b>和 ClarificationExecutor 一样，本执行器不调用 LLM，直接返回渲染后的结构图文本。
  *
- * @program: 企业级别深度设计 AI Agent。添加 阿星不是程序员 微信，添加时备注 super 来获取项目的完整资料
+ * @program: 企业级别深度设计 AI Agent。添加 wangpeng 微信，添加时备注 super 来获取项目的完整资料
  * @description: 结构图直接回答执行器 - 不调用 LLM，直接从文档结构图查询并渲染答案
- * @author: 阿星不是程序员
+ * @author: wangpeng
  **/
 @Component
 @Slf4j

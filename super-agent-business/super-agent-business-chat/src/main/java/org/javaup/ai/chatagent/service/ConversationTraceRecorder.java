@@ -51,7 +51,7 @@ import static com.google.common.base.Throwables.getStackTraceAsString;
  *   <tr><td>snapshot_json</td><td>阶段结构化快照（JSON），记录该阶段的详细输入输出数据</td></tr>
  * </table>
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Slf4j
 public class ConversationTraceRecorder {

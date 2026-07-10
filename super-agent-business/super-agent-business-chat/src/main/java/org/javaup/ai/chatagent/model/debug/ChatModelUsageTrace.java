@@ -10,7 +10,7 @@ import lombok.NoArgsConstructor;
  * <p>
  * 记录本轮对话中每次调用 LLM 的详细指标，最终汇总写入 exchange.debugTraceJson。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @Builder

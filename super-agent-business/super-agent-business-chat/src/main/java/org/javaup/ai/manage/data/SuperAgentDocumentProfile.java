@@ -24,7 +24,7 @@ import org.javaup.database.data.BaseTableData;
  * 文档画像用于 ChatPreparationOrchestrator 的路由决策，帮助判断
  * 应该走结构图查询还是语义检索。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

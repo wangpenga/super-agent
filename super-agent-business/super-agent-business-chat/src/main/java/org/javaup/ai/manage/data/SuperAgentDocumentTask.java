@@ -20,7 +20,7 @@ import java.util.Date;
  * 文档处理的生命周期阶段：
  * 文件上传 → 内容解析 → 策略路由 → 策略确认 → 切块执行 → 切块后处理 → 向量化 → 入库完成
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

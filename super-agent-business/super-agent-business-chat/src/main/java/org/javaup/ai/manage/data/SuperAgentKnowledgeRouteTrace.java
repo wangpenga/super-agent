@@ -21,7 +21,7 @@ import java.math.BigDecimal;
  * "影子"（shadow）模式的意义：即使在实际文档问答中不使用 AUTO_DOCUMENT 的路由结果，
  * 也会记录一次 shadow route trace，用于分析路由的准确性和改进空间。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

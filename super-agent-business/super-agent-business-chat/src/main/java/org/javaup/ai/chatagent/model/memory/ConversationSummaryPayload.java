@@ -15,7 +15,7 @@ import java.util.List;
  * LLM 在记忆压缩时生成：将 N 轮对话提炼为结构化的会话状态，
  * 供后续问答中的路由决策使用。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @Builder

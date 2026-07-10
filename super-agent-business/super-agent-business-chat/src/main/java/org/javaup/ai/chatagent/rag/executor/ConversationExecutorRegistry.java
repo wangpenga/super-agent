@@ -24,9 +24,9 @@ import java.util.Map;
  * <p>
  * <b>查找失败处理：</b>如果 mode 对应的执行器不存在（如配置错误），抛出 IllegalStateException。
  *
- * @program: 企业级别深度设计 AI Agent。添加 阿星不是程序员 微信，添加时备注 super 来获取项目的完整资料
+ * @program: 企业级别深度设计 AI Agent。添加 wangpeng 微信，添加时备注 super 来获取项目的完整资料
  * @description: 对话执行器注册表 - 按 ExecutionMode 查找对应执行器
- * @author: 阿星不是程序员
+ * @author: wangpeng
  **/
 @Component
 public class ConversationExecutorRegistry {

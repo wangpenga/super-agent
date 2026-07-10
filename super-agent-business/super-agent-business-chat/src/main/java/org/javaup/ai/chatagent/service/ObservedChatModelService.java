@@ -34,7 +34,7 @@ import org.springframework.ai.openai.OpenAiChatOptions;
  *   <li><b>参数覆盖</b>：支持按调用覆盖 temperature/topP/model（{@link #mergeOptions}）</li>
  * </ul>
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Slf4j
 @Service

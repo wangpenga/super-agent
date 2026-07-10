@@ -21,7 +21,7 @@ import java.math.BigDecimal;
  * <p>
  * 用于检索效果的可观测性分析和调优。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

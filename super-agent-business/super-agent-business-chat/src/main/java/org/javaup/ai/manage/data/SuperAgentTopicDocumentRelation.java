@@ -20,7 +20,7 @@ import java.math.BigDecimal;
  * 关联关系可以由系统自动生成（基于 embedding 相似度或关键词匹配），
  * 也可以由人工维护以确保关键文档的主题归属准确。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

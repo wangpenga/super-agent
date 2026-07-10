@@ -40,9 +40,9 @@ import org.springframework.stereotype.Component;
  * <b>数据流方向：</b>
  * Executor 产生数据 → StreamEventWriter 包装为 JSON → Sink.emitNext → Flux → SSE 连接 → 客户端
  *
- * @program: 企业级别深度设计 AI Agent。添加 阿星不是程序员 微信，添加时备注 super 来获取项目的完整资料
+ * @program: 企业级别深度设计 AI Agent。添加 wangpeng 微信，添加时备注 super 来获取项目的完整资料
  * @description: SSE 事件写入器 - 将业务数据包装为 JSON SSE 事件并序列化
- * @author: 阿星不是程序员
+ * @author: wangpeng
  **/
 @Component
 public class StreamEventWriter {

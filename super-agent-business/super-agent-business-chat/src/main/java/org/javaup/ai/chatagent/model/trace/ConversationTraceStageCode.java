@@ -5,7 +5,7 @@ package org.javaup.ai.chatagent.model.trace;
  * <p>
  * 每个阶段按 order 顺序执行，order 值表示执行的先后顺序。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 public enum ConversationTraceStageCode {
 

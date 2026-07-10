@@ -1,0 +1,108 @@
+server:
+  port: 9090
+  servlet:
+    encoding:
+      charset: UTF-8
+      enabled: true
+      force: true
+prefix:
+  distinction:
+    name: super-agent-eval
+spring:
+  application:
+    name: ${prefix.distinction.name:super-agent-eval}
+  datasource:
+    # 与主服务共用同一 MySQL 实例，表名前缀 super_agent_eval_* 以示区分
+    url: jdbc:mysql://127.0.0.1:3306/super_agent_business_chat?createDatabaseIfNotExist=true&useUnicode=true&characterEncoding=UTF-8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
+    username: root
+    password: 123456
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      pool-name: super-agent-eval-hikari
+      maximum-pool-size: 5
+      minimum-idle: 1
+  ai:
+    openai:
+      # LLM-as-Judge 使用和主服务相同的 LLM API 地址
+      base-url: https://dashscope.aliyuncs.com/compatible-mode/
+      api-key: ${ALI_BAI_LIAN_API_KEY:sk-5ea337035f9a4cd8947989b003a5136f}
+      chat:
+        options:
+          # Judge 模型可以比生产模型小一点，节省成本
+          model: qwen-plus-latest
+          # Judge 需要高确定性，温度设低
+          temperature: 0.1
+          maxTokens: 2000
+      embedding:
+        base-url: https://dashscope.aliyuncs.com/compatible-mode/
+        api-key: ${ALI_BAI_LIAN_API_KEY:sk-5ea337035f9a4cd8947989b003a5136f}
+        options:
+          model: text-embedding-v4
+  main:
+    allow-bean-definition-overriding: true
+  jackson:
+    time-zone: GMT+8
+    date-format: yyyy-MM-dd HH:mm:ss
+
+mybatis-plus:
+  mapper-locations: classpath:mapper/*.xml
+  configuration:
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+    local-cache-scope: statement
+  global-config:
+    db-config:
+      id-type: auto
+      table-prefix: super_agent_eval_
+
+# ============================================================
+# 评估模块专属配置
+# ============================================================
+eval:
+  # 主服务检索 API 地址（eval 服务通过 RestTemplate 调用）
+  chat-service:
+    url: http://127.0.0.1:9082
+    retrieve-api: /api/internal/rag/retrieve
+
+  # LLM-as-Judge 分层判题阈值
+  judge:
+    rerank-threshold-high: 0.5   # rerank ≥ 0.5 → 直接判为 relevant
+    rerank-threshold-low: 0.3    # rerank < 0.3  → 直接判为 irrelevant
+    judge-concurrency: 2         # LLM Judge 并发数
+    judge-model: qwen-plus-latest
+
+  # 数据集生成
+  dataset:
+    min-questions-per-document: 3
+    max-questions-per-document: 10
+    ground-truth-extract-top-k: 20  # 标注时检索候选数
+    auto-generate-on-startup: false
+
+  # 评估管道
+  pipeline:
+    concurrency: 4                # 并发评估数
+    timeout-per-question-ms: 30000
+    relevance-judge-concurrency: 2
+
+  # A/B 测试
+  optimization:
+    ab-test-enabled: true
+    config-profiles:
+      baseline: {}
+      variant-a:
+        min-vector-similarity: 0.50
+        vector-top-k: 12
+        keyword-top-k: 12
+
+# Prometheus 指标暴露
+management:
+  metrics:
+    tags:
+      application: super-agent-eval
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus
+  prometheus:
+    metrics:
+      export:
+        enabled: true

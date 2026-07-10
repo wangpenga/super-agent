@@ -17,7 +17,7 @@ import java.util.List;
  * 前端调试面板通过这个 JSON 展示一轮对话的完整执行过程：
  * 问题改写 → 路由决策 → 历史记忆 → 检索 → 工具调用 → LLM 生成。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @Builder

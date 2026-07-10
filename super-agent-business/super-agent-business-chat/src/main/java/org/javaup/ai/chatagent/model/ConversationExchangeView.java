@@ -25,7 +25,7 @@ import java.util.List;
  * completeExchange → status=COMPLETED/FAILED/STOPPED, answer 回填
  * </pre>
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

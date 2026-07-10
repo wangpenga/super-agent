@@ -19,7 +19,7 @@ import java.util.Date;
  * 当对话轮次超过一定数量后，系统会对历史对话进行压缩，生成长摘要存入此表，
  * 以便在新一轮对话时快速装载历史上下文，而不需要每次都读取全部历史轮次。
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Data
 @NoArgsConstructor

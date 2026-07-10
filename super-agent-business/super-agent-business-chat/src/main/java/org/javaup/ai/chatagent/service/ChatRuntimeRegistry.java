@@ -23,7 +23,7 @@ import java.util.concurrent.ConcurrentMap;
  *   <li>TaskInfo.finalized CAS —— 保证收尾逻辑只执行一次</li>
  * </ol>
  *
- * @author 阿星不是程序员
+ * @author wangpeng
  */
 @Component
 public class ChatRuntimeRegistry {

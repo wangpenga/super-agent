@@ -33,9 +33,9 @@ import java.util.Map;
  * 这两个执行器会调用 LLM，返回流式文本 Flux；而本执行器直接返回单条文本 Flux.just(clarificationReply)，
  * 是一次性返回，不涉及流式生成。
  *
- * @program: 企业级别深度设计 AI Agent。添加 阿星不是程序员 微信，添加时备注 super 来获取项目的完整资料
+ * @program: 企业级别深度设计 AI Agent。添加 wangpeng 微信，添加时备注 super 来获取项目的完整资料
  * @description: 澄清执行器 - AUTO_DOCUMENT 下文档歧义时引导用户确认，不调用 LLM
- * @author: 阿星不是程序员
+ * @author: wangpeng
  **/
 @Component
 public class ClarificationExecutor implements ConversationExecutor {
