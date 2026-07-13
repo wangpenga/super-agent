@@ -3,11 +3,12 @@ package org.javaup.ai.chatagent.rag.controller;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.javaup.ai.chatagent.model.SearchReference;
 import org.javaup.ai.chatagent.rag.model.ConversationExecutionPlan;
 import org.javaup.ai.chatagent.rag.model.RagRetrievalContext;
 import org.javaup.ai.chatagent.rag.model.SubQuestionEvidence;
 import org.javaup.ai.chatagent.rag.service.RagRetrievalEngine;
+import org.javaup.ai.manage.data.SuperAgentDocument;
+import org.javaup.ai.manage.mapper.SuperAgentDocumentMapper;
 import org.springframework.ai.document.Document;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -35,6 +36,7 @@ import java.util.stream.Collectors;
 public class EvalApiController {
 
     private final RagRetrievalEngine ragRetrievalEngine;
+    private final SuperAgentDocumentMapper documentMapper;
 
     /**
      * 纯检索接口（供 eval 服务调用）
@@ -50,18 +52,28 @@ public class EvalApiController {
 
         long startTime = System.currentTimeMillis();
 
-        // 1. 构造最小化的 ConversationExecutionPlan
-        //     只需填充检索必需字段：问题 + 目标文档
+        // 1. 查询文档的最新索引任务 ID（vector 和 keyword 检索都需要 taskId 过滤）
+        Long taskId = null;
+        SuperAgentDocument doc = documentMapper.selectById(request.getDocumentId());
+        if (doc != null && doc.getLastIndexTaskId() != null) {
+            taskId = doc.getLastIndexTaskId();
+            log.debug("查询到文档 lastIndexTaskId: documentId={}, taskId={}", request.getDocumentId(), taskId);
+        } else {
+            log.warn("文档 {} 未找到或无 lastIndexTaskId，检索可能返回空", request.getDocumentId());
+        }
+
+        // 2. 构造最小化的 ConversationExecutionPlan
+        //     关键：必须填充 selectedDocumentId + selectedTaskId，否则检索 SQL 的 task_id IN (...) 条件不匹配
         ConversationExecutionPlan plan = ConversationExecutionPlan.builder()
             .originalQuestion(request.getQuestion())
             .retrievalQuestion(request.getQuestion())
+            .selectedDocumentId(request.getDocumentId())
+            .selectedTaskId(taskId)
+            .retrievalDocumentIds(taskId != null ? List.of(request.getDocumentId()) : List.of())
+            .retrievalTaskIds(taskId != null ? List.of(taskId) : List.of())
             .build();
 
-        // 设置目标文档范围（两字段都设，通道 supports 检查 getSelectedDocumentId）
-        plan.setSelectedDocumentId(request.getDocumentId());
-        plan.setRetrievalDocumentIds(List.of(request.getDocumentId()));
-
-        // 2. 调用检索引擎（不传 traceRecorder，避免产生数据库追踪记录）
+        // 3. 调用检索引擎（不传 traceRecorder，避免产生数据库追踪记录）
         RagRetrievalContext context = ragRetrievalEngine.retrieve(plan, null);
 
         // 3. 转换为扁平化的 RPC 响应

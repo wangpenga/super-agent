@@ -59,4 +59,21 @@ public class EvalDataset extends BaseEvalEntity {
 
     /** 来源对话的 exchange_id（source=conversation_log 时） */
     private Long exchangeId;
+
+    // ═══════════════ 人工抽检字段 ═══════════════
+
+    /** 参考答案（人工准备或 LLM 生成的标准答案） */
+    private String referenceAnswer;
+
+    /** LLM 基于检索 chunks 生成的答案 */
+    private String generatedAnswer;
+
+    /** 人工评分（1~5），null 表示未评 */
+    private Integer humanScore;
+
+    /** 人工评语 */
+    private String humanComment;
+
+    /** 抽检状态：0=待处理 1=已生成答案 2=已评分 */
+    private Integer reviewStatus;
 }

@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS super_agent_eval_dataset (
     document_id               BIGINT          NOT NULL                 COMMENT '文档 ID',
     question                  TEXT            NOT NULL                 COMMENT '测试问题',
     source                    VARCHAR(32)     NOT NULL DEFAULT 'profile' COMMENT '问题来源：conversation_log / profile / llm_generated / manual',
-    ground_truth_chunk_ids    JSON            NOT NULL                 COMMENT '相关 chunk ID 列表 [1,2,3]',
+    ground_truth_chunk_ids    JSON            DEFAULT '[]'             COMMENT '相关 chunk ID 列表 [1,2,3]（人工录入可为空）',
     ground_truth_parent_block_ids JSON       DEFAULT NULL              COMMENT '相关父块 ID 列表（可选）',
     difficulty                VARCHAR(16)     DEFAULT 'medium'          COMMENT '难度：easy / medium / hard',
     tags                      VARCHAR(255)    DEFAULT NULL             COMMENT '标签，逗号分隔',
@@ -97,3 +97,16 @@ CREATE TABLE IF NOT EXISTS super_agent_eval_metric_daily (
     PRIMARY KEY (id),
     UNIQUE KEY uk_metric_date_name (metric_date, metric_name)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='RAG 评估指标日汇总表';
+
+
+-- ============================================================
+-- 人工抽检新增字段（ALTER TABLE）
+-- 如果表已存在，执行以下 ALTER 语句
+-- ============================================================
+ALTER TABLE super_agent_eval_dataset
+    ADD COLUMN reference_answer     TEXT            DEFAULT NULL     COMMENT '参考答案（人工或LLM准备的标准答案）' AFTER exchange_id,
+    ADD COLUMN generated_answer     TEXT            DEFAULT NULL     COMMENT 'LLM 基于检索 chunks 生成的答案' AFTER reference_answer,
+    ADD COLUMN human_score          TINYINT(1)      DEFAULT NULL     COMMENT '人工评分（1~5），null=未评' AFTER generated_answer,
+    ADD COLUMN human_comment        VARCHAR(500)    DEFAULT NULL     COMMENT '人工评语' AFTER human_score,
+    ADD COLUMN review_status        TINYINT(1)      DEFAULT 0        COMMENT '抽检状态：0=待处理 1=已生成答案 2=已评分' AFTER human_comment,
+    ADD INDEX idx_review_status (review_status);

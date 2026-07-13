@@ -436,6 +436,101 @@ export const adminAuthApi = {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// RAG 评估模块 API
+// eval 服务独立部署在 9090 端口，不走主服务的 API 网关，
+// 所以直接使用 requestJson（不经过 envelope 解包）。
+// ═══════════════════════════════════════════════════════════════════
+const EVAL_BASE_URL = import.meta.env.VITE_EVAL_BASE_URL || 'http://localhost:9090'
+
+/**
+ * 请求 eval 服务（独立端口，JSON body + JSON 响应）
+ */
+async function requestEval(path, body) {
+  return requestJson(`${EVAL_BASE_URL}${path}`, {
+    method: 'POST',
+    body
+  })
+}
+
+export const evalApi = {
+  // ── 数据集 ──
+  generateDataset(documentId) {
+    return requestEval('/api/admin/eval/dataset/generate', { documentId })
+  },
+  listDataset(params) {
+    return requestEval('/api/admin/eval/dataset/list', params || {})
+  },
+  deleteDataset(documentId) {
+    return requestEval('/api/admin/eval/dataset/delete', { documentId })
+  },
+  exportDataset() {
+    return requestEval('/api/admin/eval/dataset/export', {})
+  },
+  importDataset(jsonStr) {
+    return requestEval('/api/admin/eval/dataset/import', jsonStr)
+  },
+
+  // ── 手动 CRUD ──
+  saveDataset(params) {
+    return requestEval('/api/admin/eval/dataset/save', params)
+  },
+  deleteDatasetItem(id) {
+    return requestEval('/api/admin/eval/dataset/delete', { id })
+  },
+
+  // ── 运行 ──
+  startRun(runName, runType = 'manual') {
+    return requestEval('/api/admin/eval/run/start', { runName, runType })
+  },
+  stopRun() {
+    return requestEval('/api/admin/eval/run/stop', {})
+  },
+  listRuns() {
+    return requestEval('/api/admin/eval/run/list', {})
+  },
+  getRunDetail(runId) {
+    return requestEval('/api/admin/eval/run/detail', { runId })
+  },
+  getRunStatus() {
+    return requestEval('/api/admin/eval/run/status', {})
+  },
+  listResults(runId) {
+    return requestEval('/api/admin/eval/run/result/list', { runId })
+  },
+  analyzeRun(runId) {
+    return requestEval('/api/admin/eval/run/analyze', { runId })
+  },
+
+  // ── 看板 ──
+  getDashboardSummary() {
+    return requestEval('/api/admin/eval/dashboard/summary', {})
+  },
+  getTrend(params) {
+    return requestEval('/api/admin/eval/dashboard/trend', params || {})
+  },
+
+  // ── 人工抽检 ──
+  listReview(params) {
+    return requestEval('/api/admin/eval/review/list', params || {})
+  },
+  getReviewDetail(datasetId) {
+    return requestEval('/api/admin/eval/review/detail', { datasetId })
+  },
+  generateAnswer(datasetId) {
+    return requestEval('/api/admin/eval/review/generate-answer', { datasetId })
+  },
+  saveReferenceAnswer(datasetId, referenceAnswer) {
+    return requestEval('/api/admin/eval/review/save-reference', { datasetId, referenceAnswer })
+  },
+  rateReview(datasetId, score, comment) {
+    return requestEval('/api/admin/eval/review/rate', { datasetId, score, comment })
+  },
+  importConversations(documentId, limit = 20) {
+    return requestEval('/api/admin/eval/review/import-conversations', { documentId, limit })
+  }
+}
+
 export const manageApi = {
   uploadDocument({ file, documentName, operatorId, knowledgeScopeCode, knowledgeScopeName, businessCategory, documentTags }) {
     const formData = new FormData()

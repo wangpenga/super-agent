@@ -5,7 +5,9 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.javaup.ai.eval.config.EvalProperties;
+import org.javaup.ai.eval.data.DocumentProfileProxy;
 import org.javaup.ai.eval.data.EvalDataset;
+import org.javaup.ai.eval.mapper.DocumentProfileProxyMapper;
 import org.javaup.ai.eval.mapper.EvalDatasetMapper;
 import org.springframework.stereotype.Service;
 
@@ -26,17 +28,30 @@ public class EvalDatasetService {
 
     private final EvalDatasetMapper datasetMapper;
     private final EvalDatasetGenerator datasetGenerator;
+    private final DocumentProfileProxyMapper documentProfileMapper;
     private final EvalProperties evalProperties;
 
     /**
-     * 为指定文档自动生成测试集
+     * 为指定文档自动生成测试集。
+     * 如果 questions 为空或没传，自动从文档画像表 super_agent_document_profile
+     * 的 example_questions 字段捞取。
      *
      * @param documentId 文档 ID
-     * @param questions  候选问题列表（来自文档画像或真实日志）
+     * @param questions  候选问题列表（可选，为 null 时自动从文档画像获取）
      * @return 新生成的条目数
      */
     public int autoGenerate(Long documentId, List<String> questions) {
         EvalProperties.DatasetProperties cfg = evalProperties.getDataset();
+
+        // ★ 如果没传问题，自动从文档画像表捞 example_questions
+        if (questions == null || questions.isEmpty()) {
+            questions = fetchQuestionsFromProfile(documentId, cfg.getMaxQuestionsPerDocument());
+        }
+
+        if (questions == null || questions.isEmpty()) {
+            log.warn("文档 {} 没有任何候选问题（文档画像表也无数据），跳过生成", documentId);
+            return 0;
+        }
 
         // 生成并持久化
         List<EvalDataset> generated = datasetGenerator.generateForDocument(
@@ -74,6 +89,31 @@ public class EvalDatasetService {
             .eq(EvalDataset::getStatus, 1)
             .orderByAsc(EvalDataset::getDocumentId);
         return datasetMapper.selectList(wrapper);
+    }
+
+    /**
+     * 按主键查单条
+     */
+    public EvalDataset getById(Long id) {
+        return datasetMapper.selectById(id);
+    }
+
+    /**
+     * 新增或更新。有 id 更新，无 id 新增
+     */
+    public void save(EvalDataset dataset) {
+        if (dataset.getId() != null) {
+            datasetMapper.updateById(dataset);
+        } else {
+            datasetMapper.insert(dataset);
+        }
+    }
+
+    /**
+     * 按主键删除
+     */
+    public void deleteById(Long id) {
+        datasetMapper.deleteById(id);
     }
 
     /**
@@ -126,6 +166,45 @@ public class EvalDatasetService {
         }
         log.info("导入数据集完成：新增 {} 条", imported);
         return imported;
+    }
+
+    /**
+     * 从文档画像表获取候选问题
+     * 优先级：example_questions → LLM 基于摘要生成
+     */
+    private List<String> fetchQuestionsFromProfile(Long documentId, int maxQuestions) {
+        LambdaQueryWrapper<DocumentProfileProxy> wrapper = new LambdaQueryWrapper<DocumentProfileProxy>()
+            .eq(DocumentProfileProxy::getDocumentId, documentId);
+        DocumentProfileProxy profile = documentProfileMapper.selectOne(wrapper);
+
+        if (profile == null) {
+            log.warn("文档 {} 在 super_agent_document_profile 表中无记录", documentId);
+            return List.of();
+        }
+
+        // 优先用 example_questions
+        String exampleQuestions = profile.getExampleQuestions();
+        if (exampleQuestions != null && !exampleQuestions.isBlank()) {
+            List<String> questions = datasetGenerator.parseJsonArray(exampleQuestions);
+            if (!questions.isEmpty()) {
+                log.info("从文档画像获取 {} 条候选问题: documentId={}", questions.size(), documentId);
+                return questions;
+            }
+        }
+
+        // example_questions 为空，用 LLM 基于文档摘要生成
+        log.info("文档画像没有 example_questions，尝试用 LLM 生成: documentId={}", documentId);
+        List<String> llmQuestions = datasetGenerator.generateQuestionsByLLM(
+            profile.getDocumentSummary(),
+            profile.getCoreTopics(),
+            maxQuestions
+        );
+        if (!llmQuestions.isEmpty()) {
+            log.info("LLM 生成了 {} 个问题: documentId={}", llmQuestions.size(), documentId);
+            return llmQuestions;
+        }
+
+        return List.of();
     }
 
     private String truncate(String text, int maxLen) {

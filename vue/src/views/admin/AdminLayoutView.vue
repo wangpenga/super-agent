@@ -81,7 +81,11 @@ import {
   CommandLineIcon,
   HomeModernIcon,
   ShareIcon,
-  EyeIcon
+  EyeIcon,
+  ChartBarSquareIcon,
+  ListBulletIcon,
+  BeakerIcon,
+  HandThumbUpIcon
 } from '@heroicons/vue/24/outline'
 import IcpFooter from '../../components/IcpFooter.vue'
 import { adminAuthApi } from '../../api/api'
@@ -96,7 +100,12 @@ const navItems = [
   { to: '/admin/documents', label: '文档接入', icon: ClipboardDocumentListIcon },
   { to: '/admin/knowledge-route', label: '知识路由', icon: ShareIcon },
   { to: '/admin/knowledge-route/traces', label: '路由追踪', icon: EyeIcon },
-  { to: '/admin/observability', label: '对话观测', icon: CommandLineIcon }
+  { to: '/admin/observability', label: '对话观测', icon: CommandLineIcon },
+  // ── RAG 评估 ──
+  { to: '/admin/eval', label: 'RAG 评估', icon: ChartBarSquareIcon },
+  { to: '/admin/eval/runs', label: '评估历史', icon: ListBulletIcon },
+  { to: '/admin/eval/dataset', label: '测试集管理', icon: BeakerIcon },
+  { to: '/admin/eval/review', label: '人工抽检', icon: HandThumbUpIcon }
 ]
 
 const pageTitle = computed(() => route.meta?.title || '管理后台')

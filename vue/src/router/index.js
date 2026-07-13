@@ -100,6 +100,41 @@ const router = createRouter({
           meta: {
             title: '轮次详情'
           }
+        },
+        // ═══════════════════════════════════════
+        // RAG 评估模块
+        // ═══════════════════════════════════════
+        {
+          path: 'eval',
+          name: 'AdminEvalDashboard',
+          component: () => import('../views/admin/EvalDashboardView.vue'),
+          meta: {
+            title: 'RAG 评估'
+          }
+        },
+        {
+          path: 'eval/runs',
+          name: 'AdminEvalRuns',
+          component: () => import('../views/admin/EvalRunListView.vue'),
+          meta: {
+            title: '评估历史'
+          }
+        },
+        {
+          path: 'eval/dataset',
+          name: 'AdminEvalDataset',
+          component: () => import('../views/admin/EvalDatasetManageView.vue'),
+          meta: {
+            title: '测试集管理'
+          }
+        },
+        {
+          path: 'eval/review',
+          name: 'AdminEvalReview',
+          component: () => import('../views/admin/EvalReviewView.vue'),
+          meta: {
+            title: '人工抽检'
+          }
         }
       ]
     }

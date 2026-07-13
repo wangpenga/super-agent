@@ -33,16 +33,25 @@ public class EvalJudgeService {
     private final EvalProperties evalProperties;
 
     /**
-     * 判断单个文档块是否与问题相关
+     * 判断单个文档块是否与问题相关（rerank 优先，similarity 兜底，LLM 最后）
+     * <p>
+     * 判题优先级：
+     * <ol>
+     *   <li>有 rerankScore → 分层阈值判题（零 LLM 成本）</li>
+     *   <li>无 rerankScore，有 similarityScore → 用相似度分层（零 LLM 成本）</li>
+     *   <li>都无 → LLM Judge</li>
+     * </ol>
      *
-     * @param question    用户问题
-     * @param chunkText   文档块文本
-     * @param rerankScore rerank 分数（可为 null）
+     * @param question        用户问题
+     * @param chunkText       文档块文本
+     * @param rerankScore     rerank 分数（可为 null）
+     * @param similarityScore 向量相似度分数（可为 null，rerankScore 为 null 时备用）
      * @return 判断结果
      */
-    public JudgeResult judge(String question, String chunkText, Double rerankScore) {
+    public JudgeResult judge(String question, String chunkText, Double rerankScore, Double similarityScore) {
         EvalProperties.JudgeProperties cfg = evalProperties.getJudge();
 
+        // 第 1 优先级：rerank 分层
         if (rerankScore != null) {
             if (rerankScore >= cfg.getRerankThresholdHigh()) {
                 log.debug("Rerank 分层: relevant (score={} ≥ threshold={})",
@@ -54,10 +63,32 @@ public class EvalJudgeService {
                     String.format("%.4f", rerankScore), cfg.getRerankThresholdLow());
                 return JudgeResult.irrelevant("rerank_score=" + rerankScore, "rerank");
             }
+            // rerank 在 0.3~0.5 争议区间 → 走 LLM Judge
+            return llmJudge(question, chunkText);
         }
 
-        // 无 rerank 分或在争议区间 → LLM Judge
+        // 第 2 优先级：similarityScore（rerank 不可用时）
+        if (similarityScore != null) {
+            // similarity 分数本身就偏宽松，用稍低的阈值
+            if (similarityScore >= 0.5) {
+                log.debug("Similarity 分层: relevant (score={} ≥ 0.5)", String.format("%.4f", similarityScore));
+                return JudgeResult.relevant("similarity_score=" + similarityScore, "similarity");
+            }
+            if (similarityScore < 0.3) {
+                log.debug("Similarity 分层: irrelevant (score={} < 0.3)", String.format("%.4f", similarityScore));
+                return JudgeResult.irrelevant("similarity_score=" + similarityScore, "similarity");
+            }
+        }
+
+        // 第 3 优先级：都无有效分数 → LLM Judge
         return llmJudge(question, chunkText);
+    }
+
+    /**
+     * 简化判题（向后兼容，similarityScore 传 null）
+     */
+    public JudgeResult judge(String question, String chunkText, Double rerankScore) {
+        return judge(question, chunkText, rerankScore, null);
     }
 
     /**

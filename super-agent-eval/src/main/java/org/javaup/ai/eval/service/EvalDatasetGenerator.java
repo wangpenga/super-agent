@@ -87,9 +87,21 @@ public class EvalDatasetGenerator {
         RetrievalRpcResult result = retrievalClient.retrieve(documentId, question);
         List<RetrievalRpcResult.DocumentResult> allDocs = result.flattenDocuments();
 
+        log.info("标注诊断: documentId={}, question='{}', 检索返回 {} 个文档",
+            documentId, truncate(question, 50), allDocs.size());
+
         if (allDocs.isEmpty()) {
-            log.debug("问题检索结果为空，跳过: question='{}'", truncate(question, 50));
+            log.info("问题检索结果为空，跳过: question='{}', retrievalNotes={}",
+                truncate(question, 50), result.getRetrievalNotes());
             return null;
+        }
+
+        // 打印前 3 个文档的分数，帮排查
+        for (int i = 0; i < Math.min(3, allDocs.size()); i++) {
+            RetrievalRpcResult.DocumentResult doc = allDocs.get(i);
+            log.info("  文档[{}]: chunkId={}, rerankScore={}, similarityScore={}, text={}",
+                i, doc.getChunkId(), doc.getRerankScore(), doc.getSimilarityScore(),
+                truncate(doc.getText(), 60));
         }
 
         // 2. 用 rerank 分层 + LLM 判断哪些 chunk 与问题相关
@@ -97,7 +109,7 @@ public class EvalDatasetGenerator {
 
         for (RetrievalRpcResult.DocumentResult doc : allDocs) {
             EvalJudgeService.JudgeResult judgeResult = evalJudgeService.judge(
-                question, doc.getText(), doc.getRerankScore());
+                question, doc.getText(), doc.getRerankScore(), doc.getSimilarityScore());
 
             if (judgeResult.relevant() && doc.getChunkId() != null) {
                 relevantChunkIds.add(doc.getChunkId());

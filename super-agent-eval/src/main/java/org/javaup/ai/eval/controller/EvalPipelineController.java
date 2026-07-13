@@ -163,9 +163,9 @@ public class EvalPipelineController {
 
     /**
      * 运行状态查询
-     * GET /api/admin/eval/run/status
+     * POST /api/admin/eval/run/status（前端统一用 POST）
      */
-    @GetMapping("/status")
+    @PostMapping("/status")
     public ResponseEntity<Map<String, Object>> status() {
         return ResponseEntity.ok(Map.of(
             "running", pipelineOrchestrator.isRunning()

@@ -243,6 +243,9 @@
         <button class="ghost-button" type="button" :disabled="loading" @click="loadAll">
           {{ loading ? '刷新中...' : '刷新详情' }}
         </button>
+        <button class="ghost-button" type="button" :disabled="!documentDetail?.id" @click="goEval">
+          🧪 生成测试集
+        </button>
       </div>
     </div>
 
@@ -944,7 +947,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ArrowLeftIcon, ArrowRightIcon, CheckCircleIcon, XMarkIcon } from '@heroicons/vue/24/outline'
-import { APIError, manageApi } from '../../api/api'
+import { APIError, evalApi, manageApi } from '../../api/api'
 import AdminStatusBadge from '../../components/admin/AdminStatusBadge.vue'
 import { formatCount, formatDateTime, hasCode, normalizeCode } from '../../utils/manageFormat'
 import {
@@ -1679,6 +1682,21 @@ function scrollToWorkbenchSection(key) {
 
 function goBack() {
   router.push({ name: 'AdminDocuments' })
+}
+
+async function goEval() {
+  const docId = documentDetail.value?.id
+  if (!docId) return
+  try {
+    const result = await evalApi.generateDataset(docId)
+    if (result?.generated > 0) {
+      showNotice(`✅ 已生成 ${result.generated} 条测试数据，可前往「RAG 评估」运行评估`, 'success')
+    } else {
+      showNotice('⚠️ 未生成新数据，该文档可能已有测试集或没有候选问题', 'warning')
+    }
+  } catch (e) {
+    showNotice('生成测试集失败: ' + e.message, 'danger')
+  }
 }
 
 function buildSequenceRows(items) {
