@@ -1231,10 +1231,16 @@ public class DocumentStrategyServiceImpl implements DocumentStrategyService {
             windows.add(String.join("", sentenceList.subList(i, i + windowSize)));
         }
 
-        // ── Step B: 批量 embedding ──
-        // 一次性将所有窗口送进模型，减少 API 调用次数
-        // text-embedding-v4 支持 batch 输入
-        List<float[]> embeddings = embeddingModel.embed(windows);
+        // ── Step B: 分批批量 embedding ──
+        // 分批调用，避免超出 API 的 batch 上限（≤ 10）
+        List<float[]> embeddings = new ArrayList<>(windows.size());
+        int batchSize = 10;
+        for (int start = 0; start < windows.size(); start += batchSize) {
+            int end = Math.min(start + batchSize, windows.size());
+            List<String> batch = windows.subList(start, end);
+            List<float[]> batchResult = embeddingModel.embed(batch);
+            embeddings.addAll(batchResult);
+        }
 
         // ── Step C: 计算相邻窗口的余弦相似度 ──
         // similarities[i] = cosine(windows[i], windows[i+1])
