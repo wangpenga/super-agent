@@ -36,6 +36,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * 聊天准备编排器 - 调用链路第5层
@@ -331,84 +333,132 @@ public class ChatPreparationOrchestrator {
         List<Long> routedTaskIds = routedTaskId == null ? List.of() : List.of(routedTaskId);
 
         if (chatMode == ChatQueryMode.AUTO_DOCUMENT) {
-            // ─── 路径 B：AUTO_DOCUMENT 自动知识路由 ───
-            // ① 调用知识路由服务，根据问题内容自动匹配最相关的文档
-            KnowledgeRouteDecision routeDecision = knowledgeRouteService.route(question, rewriteQuestion);
-            // ② 记录路由追踪（用于后续分析路由准确性）
-            knowledgeRouteService.recordAutoRoute(conversationId, taskInfo.exchangeId(), question, rewriteQuestion, routeDecision);
-            // ③ 筛选候选文档列表
-            List<DocumentRouteCandidate> candidateDocuments = selectAutoCandidates(routeDecision, question, rewriteQuestion);
+            // ─── 路径 B-1：检测用户是否在回复澄清时通过"我想问《xxx》"选择了文档 ───
+            boolean userSelectedDoc = false;
+            DocumentSelection docSelection = detectDocumentSelection(question);
+            if (docSelection != null) {
+                KnowledgeDocumentDescriptor selectedDoc = findDocumentByName(docSelection.documentName);
+                if (selectedDoc != null) {
+                    userSelectedDoc = true;
+                    routedDocumentId = selectedDoc.getDocumentId();
+                    routedDocumentName = selectedDoc.getDocumentName();
+                    routedTaskId = selectedDoc.getLastIndexTaskId();
+                    routedDocumentIds = List.of(routedDocumentId);
+                    routedTaskIds = List.of(routedTaskId);
 
-            // ─── 判断是否需要向用户澄清 ───
-            // 条件：置信度 < 0.55 或 候选文档 > 1 且 top2 分数接近
-            if (shouldAskClarification(routeDecision, candidateDocuments)) {
-                // 返回 CLARIFICATION 执行计划：直接问用户想查哪个文档，不调 LLM
-                return basePlan(question, chatMode, memoryContext, historyPlanningContext, historySummary, answerHistoryContext, currentDate, currentDateText,
-                    requiresCurrentDateAnchoring, requiresFreshSearch)
-                    .mode(ExecutionMode.CLARIFICATION)  // 走 ClarificationExecutor
-                    .rewriteQuestion(rewriteQuestion)
-                    .rewriteSubQuestions(rewriteSubQuestions)
-                    .retrievalQuestion(rewriteQuestion)
-                    .retrievalSubQuestions(rewriteSubQuestions)
-                    .retrievalDocumentIds(candidateDocuments.stream()  // 候选文档 ID 列表
-                        .map(DocumentRouteCandidate::getDocumentId)
-                        .filter(StrUtil::isNotBlank)
-                        .map(Long::valueOf)
-                        .toList())
-                    .retrievalTaskIds(candidateDocuments.stream()  // 候选文档的索引任务 ID 列表
-                        .map(DocumentRouteCandidate::getLastIndexTaskId)
-                        .filter(StrUtil::isNotBlank)
-                        .map(Long::valueOf)
-                        .toList())
-                    .clarificationReply(buildClarificationReply(question, routeDecision, candidateDocuments))     // "你想问哪份文档？1. A 2. B"
-                    .clarificationOptions(buildClarificationOptions(candidateDocuments))                          // ["我想问《A》", "我想问《B》"]
-                    .clarificationReason(buildClarificationReason(routeDecision, candidateDocuments))             // "置信度 0.42，为避免误选..."
-                    .build();
+                    // ✨ 关键修复：把检索问题替换为用户上一轮的实际提问，而不是
+                    // 当前"我想问《xxx》"这个文档选择语句。
+                    // 否则检索时搜的是"我想问《个人房屋租赁合同》"，匹配到全文摘要而非具体答案。
+                    String previousQuestion = extractPreviousQuestion(memoryContext);
+                    if (StrUtil.isNotBlank(previousQuestion)) {
+                        log.info("文档选择后将原问题替换为上一轮提问: previous='{}', current='{}'",
+                            previousQuestion, question);
+                        question = previousQuestion;
+                        rewriteQuestion = previousQuestion;
+                        rewriteSubQuestions = List.of(previousQuestion);
+                        // 替换 rewriteResult 对象，避免下游 DocumentQuestionRouter
+                        // 和检索引擎仍使用基于"我想问《xxx》"的错误改写结果
+                        rewriteResult = new RagRewriteResult(previousQuestion, List.of(previousQuestion));
+                    }
+
+                    log.info("用户通过'{}'明确选择了文档: documentId={}, documentName={}",
+                        docSelection.matchText, selectedDoc.getDocumentId(), selectedDoc.getDocumentName());
+                    if (traceRecorder != null) {
+                        traceRecorder.completeStage(
+                            traceRecorder.startStage(ConversationTraceStageCode.ROUTE, "AUTO_DOCUMENT", "用户明确选择了文档。", null),
+                            "用户通过「" + docSelection.matchText + "」选择了文档「" + selectedDoc.getDocumentName() + "」，跳过知识路由。",
+                            Map.of(
+                                "userSelection", docSelection.matchText,
+                                "selectedDocumentName", selectedDoc.getDocumentName(),
+                                "selectedDocumentId", selectedDoc.getDocumentId()
+                            )
+                        );
+                    }
+                } else {
+                    log.warn("用户选择了文档但未在可检索文档中找到: docName='{}', question='{}'", docSelection.documentName, question);
+                }
             }
 
-            // ─── 不需要澄清 → 确定 top 文档 ───
-            // 置信度 >= 0.55 且至少有 1 个候选 → 选第一个作为目标文档
-            boolean confidentTopDocument = routeDecision != null
-                && routeDecision.getConfidence() != null
-                && routeDecision.getConfidence().doubleValue() >= 0.55D;
-            DocumentRouteCandidate topDocument = confidentTopDocument && !candidateDocuments.isEmpty() ? candidateDocuments.get(0) : null;
-            if (topDocument != null && StrUtil.isNotBlank(topDocument.getDocumentId()) && StrUtil.isNotBlank(topDocument.getLastIndexTaskId())) {
-                // 路由成功：用自动选定的文档替换 selectedDocument
-                routedDocumentId = Long.valueOf(topDocument.getDocumentId());
-                routedDocumentName = topDocument.getDocumentName();
-                routedTaskId = Long.valueOf(topDocument.getLastIndexTaskId());
-            }
-            else {
-                // 路由失败（置信度不足或候选为空）→ 清空文档信息，走兜底
-                routedDocumentId = null;
-                routedDocumentName = "";
-                routedTaskId = null;
-            }
-            // 候选文档列表（可能多个，用于后续的多文档检索）
-            routedDocumentIds = candidateDocuments.stream()
-                .map(DocumentRouteCandidate::getDocumentId)
-                .filter(StrUtil::isNotBlank)
-                .map(Long::valueOf)
-                .toList();
-            routedTaskIds = candidateDocuments.stream()
-                .map(DocumentRouteCandidate::getLastIndexTaskId)
-                .filter(StrUtil::isNotBlank)
-                .map(Long::valueOf)
-                .toList();
+            if (!userSelectedDoc) {
+                // ─── 路径 B-2：AUTO_DOCUMENT 自动知识路由 ───
+                // ① 调用知识路由服务，根据问题内容自动匹配最相关的文档
+                KnowledgeRouteDecision routeDecision = knowledgeRouteService.route(question, rewriteQuestion);
+                // ② 记录路由追踪（用于后续分析路由准确性）
+                knowledgeRouteService.recordAutoRoute(conversationId, taskInfo.exchangeId(), question, rewriteQuestion, routeDecision);
+                // ③ 筛选候选文档列表（已按文档名去重）
+                List<DocumentRouteCandidate> candidateDocuments = selectAutoCandidates(routeDecision, question, rewriteQuestion);
 
-            if (traceRecorder != null) {
-                traceRecorder.completeStage(
-                    traceRecorder.startStage(ConversationTraceStageCode.ROUTE, "AUTO_DOCUMENT", "正在生成知识范围候选。", null),
-                    "知识范围路由完成。",
-                    Map.of(
-                        "confidence", routeDecision == null || routeDecision.getConfidence() == null ? "" : routeDecision.getConfidence().toPlainString(),
-                        "routeStatus", routeDecision == null ? "" : StrUtil.blankToDefault(routeDecision.getRouteStatus(), ""),
-                        "candidateDocumentCount", candidateDocuments.size(),
-                        "confidentTopDocument", confidentTopDocument,
-                        "topDocumentId", topDocument == null ? "" : StrUtil.blankToDefault(topDocument.getDocumentId(), ""),
-                        "topDocumentName", topDocument == null ? "" : StrUtil.blankToDefault(topDocument.getDocumentName(), "")
-                    )
-                );
+                // ─── 判断是否需要向用户澄清 ───
+                // 条件：置信度 < 0.55 或 候选文档 > 1 且 top2 分数接近
+                if (shouldAskClarification(routeDecision, candidateDocuments)) {
+                    // 返回 CLARIFICATION 执行计划：直接问用户想查哪个文档，不调 LLM
+                    return basePlan(question, chatMode, memoryContext, historyPlanningContext, historySummary, answerHistoryContext, currentDate, currentDateText,
+                        requiresCurrentDateAnchoring, requiresFreshSearch)
+                        .mode(ExecutionMode.CLARIFICATION)  // 走 ClarificationExecutor
+                        .rewriteQuestion(rewriteQuestion)
+                        .rewriteSubQuestions(rewriteSubQuestions)
+                        .retrievalQuestion(rewriteQuestion)
+                        .retrievalSubQuestions(rewriteSubQuestions)
+                        .retrievalDocumentIds(candidateDocuments.stream()  // 候选文档 ID 列表（已去重）
+                            .map(DocumentRouteCandidate::getDocumentId)
+                            .filter(StrUtil::isNotBlank)
+                            .map(Long::valueOf)
+                            .toList())
+                        .retrievalTaskIds(candidateDocuments.stream()  // 候选文档的索引任务 ID 列表
+                            .map(DocumentRouteCandidate::getLastIndexTaskId)
+                            .filter(StrUtil::isNotBlank)
+                            .map(Long::valueOf)
+                            .toList())
+                        .clarificationReply(buildClarificationReply(question, routeDecision, candidateDocuments))     // "你想问哪份文档？1. A 2. B"
+                        .clarificationOptions(buildClarificationOptions(candidateDocuments))                          // ["我想问《A》", "我想问《B》"]
+                        .clarificationReason(buildClarificationReason(routeDecision, candidateDocuments))             // "置信度 0.42，为避免误选..."
+                        .build();
+                }
+
+                // ─── 不需要澄清 → 确定 top 文档 ───
+                // 置信度 >= 0.55 且至少有 1 个候选 → 选第一个作为目标文档
+                boolean confidentTopDocument = routeDecision != null
+                    && routeDecision.getConfidence() != null
+                    && routeDecision.getConfidence().doubleValue() >= 0.55D;
+                DocumentRouteCandidate topDocument = confidentTopDocument && !candidateDocuments.isEmpty() ? candidateDocuments.get(0) : null;
+                if (topDocument != null && StrUtil.isNotBlank(topDocument.getDocumentId()) && StrUtil.isNotBlank(topDocument.getLastIndexTaskId())) {
+                    // 路由成功：用自动选定的文档替换 selectedDocument
+                    routedDocumentId = Long.valueOf(topDocument.getDocumentId());
+                    routedDocumentName = topDocument.getDocumentName();
+                    routedTaskId = Long.valueOf(topDocument.getLastIndexTaskId());
+                }
+                else {
+                    // 路由失败（置信度不足或候选为空）→ 清空文档信息，走兜底
+                    routedDocumentId = null;
+                    routedDocumentName = "";
+                    routedTaskId = null;
+                }
+                // 候选文档列表（可能多个，用于后续的多文档检索）
+                routedDocumentIds = candidateDocuments.stream()
+                    .map(DocumentRouteCandidate::getDocumentId)
+                    .filter(StrUtil::isNotBlank)
+                    .map(Long::valueOf)
+                    .toList();
+                routedTaskIds = candidateDocuments.stream()
+                    .map(DocumentRouteCandidate::getLastIndexTaskId)
+                    .filter(StrUtil::isNotBlank)
+                    .map(Long::valueOf)
+                    .toList();
+
+                if (traceRecorder != null) {
+                    traceRecorder.completeStage(
+                        traceRecorder.startStage(ConversationTraceStageCode.ROUTE, "AUTO_DOCUMENT", "正在生成知识范围候选。", null),
+                        "知识范围路由完成。",
+                        Map.of(
+                            "confidence", routeDecision == null || routeDecision.getConfidence() == null ? "" : routeDecision.getConfidence().toPlainString(),
+                            "routeStatus", routeDecision == null ? "" : StrUtil.blankToDefault(routeDecision.getRouteStatus(), ""),
+                            "candidateDocumentCount", candidateDocuments.size(),
+                            "confidentTopDocument", confidentTopDocument,
+                            "topDocumentId", topDocument == null ? "" : StrUtil.blankToDefault(topDocument.getDocumentId(), ""),
+                            "topDocumentName", topDocument == null ? "" : StrUtil.blankToDefault(topDocument.getDocumentName(), "")
+                        )
+                    );
+                }
             }
         }
         else if (chatMode == ChatQueryMode.DOCUMENT) {
@@ -674,10 +724,39 @@ public class ChatPreparationOrchestrator {
         if (candidates.isEmpty()) {
             return fallbackDocuments(question, rewriteQuestion, candidateLimit);
         }
+        // 低置信度时合并路由候选和兜底候选，并去重
         if (routeDecision.getConfidence() != null && routeDecision.getConfidence().doubleValue() < 0.55D) {
-            return mergeCandidates(candidates, fallbackDocuments(question, rewriteQuestion, candidateLimit), candidateLimit);
+            List<DocumentRouteCandidate> merged = mergeCandidates(candidates, fallbackDocuments(question, rewriteQuestion, candidateLimit), candidateLimit);
+            // 按文档名再次去重：同名文档保留分数最高的那个，避免列表中出现重复项
+            return deduplicateCandidatesByName(merged);
         }
-        return candidates;
+        // 按文档名去重后返回
+        return deduplicateCandidatesByName(candidates);
+    }
+
+    /**
+     * 按文档名去重候选文档列表，同名文档保留分数最高的那个。
+     * 解决同一文档因多个 taskId 或评分通道不同导致重复出现在候选中的问题。
+     */
+    private List<DocumentRouteCandidate> deduplicateCandidatesByName(List<DocumentRouteCandidate> candidates) {
+        if (candidates == null || candidates.isEmpty()) {
+            return candidates == null ? List.of() : candidates;
+        }
+        Map<String, DocumentRouteCandidate> nameMap = new LinkedHashMap<>();
+        for (DocumentRouteCandidate candidate : candidates) {
+            String normalizedName = normalizeDocName(candidate.getDocumentName());
+            if (StrUtil.isBlank(normalizedName)) {
+                // 文档名为空时直接用 documentId 作为 key
+                nameMap.merge(candidate.getDocumentId(), candidate, (existing, incoming) ->
+                    (incoming.getScore() != null && (existing.getScore() == null || incoming.getScore().compareTo(existing.getScore()) > 0)) ? incoming : existing
+                );
+                continue;
+            }
+            nameMap.merge(normalizedName, candidate, (existing, incoming) ->
+                (incoming.getScore() != null && (existing.getScore() == null || incoming.getScore().compareTo(existing.getScore()) > 0)) ? incoming : existing
+            );
+        }
+        return new ArrayList<>(nameMap.values());
     }
 
     private List<DocumentRouteCandidate> fallbackDocuments(String question,
@@ -889,5 +968,141 @@ public class ChatPreparationOrchestrator {
             return true;
         }
         return CHITCHAT_HINTS.stream().anyMatch(normalizedQuestion::contains);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // AUTO_DOCUMENT 模式下的文档选择检测（解决澄清循环问题）
+    // ═══════════════════════════════════════════════════════════════════
+
+    /**
+     * 检测用户是否通过"我想问《xxx》"等方式在 AUTO_DOCUMENT 模式中选择了文档。
+     * <p>
+     * 当系统返回澄清列表后，用户回复如"我想问《个人房屋租赁合同.docx》"时，
+     * 识别出这是一次文档选择，而不是一个新的知识路由请求。
+     *
+     * @param question 用户当前的问题
+     * @return 如果检测到文档选择意图，返回包含文档名的 DocumentSelection；否则返回 null
+     */
+    private DocumentSelection detectDocumentSelection(String question) {
+        if (StrUtil.isBlank(question)) {
+            return null;
+        }
+        String normalized = question.trim();
+
+        // 模式 1：明确的文档选择句式 —— "我想问《xxx》" / "我要问《xxx》" / "选《xxx》" 等
+        Pattern selectionPattern = Pattern.compile(
+            "(?:我想问|我要问|我问|选择|选|我要看|请问)?[《]([^》]{1,50})[》]"
+        );
+        Matcher matcher = selectionPattern.matcher(normalized);
+        if (matcher.find()) {
+            String docName = matcher.group(1).trim();
+            if (StrUtil.isNotBlank(docName) && docName.length() >= 2) {
+                return new DocumentSelection(docName, matcher.group());
+            }
+        }
+
+        // 模式 2：用户直接回复了文档名（数字序号选择），如 "1" / "第一个" / "文档一"
+        Pattern numberPattern = Pattern.compile("^\\s*[第]?[一二两三四五六七八九十0-9]+[个份篇]?\\s*$");
+        if (numberPattern.matcher(normalized).matches()) {
+            // 纯数字选择无法直接映射到文档名，这里不做处理
+            // 交给下游知识路由处理
+            return null;
+        }
+
+        return null;
+    }
+
+    /**
+     * 根据文档名（或部分文档名）在可检索文档列表中查找匹配的文档。
+     * <p>
+     * 匹配策略：精确匹配 → 前缀匹配 → 包含匹配
+     *
+     * @param docName 用户选择的文档名（可能不完整）
+     * @return 匹配的文档描述，未找到返回 null
+     */
+    private KnowledgeDocumentDescriptor findDocumentByName(String docName) {
+        if (StrUtil.isBlank(docName)) {
+            return null;
+        }
+        List<KnowledgeDocumentDescriptor> docs = documentKnowledgeService.listRetrievableDocuments();
+        if (docs == null || docs.isEmpty()) {
+            return null;
+        }
+        String normalizedTarget = normalizeDocName(docName);
+
+        // 精确匹配
+        for (KnowledgeDocumentDescriptor doc : docs) {
+            if (normalizeDocName(doc.getDocumentName()).equals(normalizedTarget)) {
+                return doc;
+            }
+        }
+
+        // 前缀匹配（用户输入开头部分匹配文档名，或文档名开头部分匹配用户输入）
+        for (KnowledgeDocumentDescriptor doc : docs) {
+            String normalizedDocName = normalizeDocName(doc.getDocumentName());
+            if (normalizedDocName.startsWith(normalizedTarget)
+                || normalizedTarget.startsWith(normalizedDocName)
+                || normalizedDocName.contains(normalizedTarget)
+                || normalizedTarget.contains(normalizedDocName)) {
+                return doc;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * 标准化文档名：去空白、特殊字符、转小写，用于比较。
+     */
+    private String normalizeDocName(String name) {
+        return StrUtil.blankToDefault(name, "")
+            .replaceAll("[\\s>`*#_\\-，,。；;：:（）()“”\"'\\[\\].]+", "")
+            .toLowerCase(Locale.ROOT);
+    }
+
+    /**
+     * 从会话记忆的近期对话文本中提取上一轮用户的问题。
+     * <p>
+     * recentTranscript 的格式为：
+     * <pre>
+     * 用户: 房子位于哪里
+     * 助手: 这个问题目前存在文档范围歧义...
+     * </pre>
+     * 取最后一组"用户:"后面的内容作为上一轮的实际提问。
+     *
+     * @param memoryContext 会话记忆上下文（含 recentTranscript）
+     * @return 上一轮用户的问题文本，如果没找到则返回空字符串
+     */
+    private String extractPreviousQuestion(ConversationMemoryContext memoryContext) {
+        String transcript = memoryContext == null ? "" : memoryContext.getRecentTranscript();
+        if (StrUtil.isBlank(transcript)) {
+            return "";
+        }
+        // 查找所有 "用户:" 或 "用户：" 开头行，取最后一个
+        Pattern pattern = Pattern.compile("用户[：:]([^\\n]+)");
+        Matcher matcher = pattern.matcher(transcript);
+        String lastQuestion = "";
+        while (matcher.find()) {
+            String matched = matcher.group(1).trim();
+            if (StrUtil.isNotBlank(matched)) {
+                lastQuestion = matched;
+            }
+        }
+        return lastQuestion;
+    }
+
+    /**
+     * 文档选择结果 —— 用户通过"我想问《xxx》"等模式选择了文档。
+     */
+    private static final class DocumentSelection {
+        /** 提取出的文档名 */
+        private final String documentName;
+        /** 用户输入的匹配原文（用于日志和追踪） */
+        private final String matchText;
+
+        private DocumentSelection(String documentName, String matchText) {
+            this.documentName = documentName;
+            this.matchText = matchText;
+        }
     }
 }

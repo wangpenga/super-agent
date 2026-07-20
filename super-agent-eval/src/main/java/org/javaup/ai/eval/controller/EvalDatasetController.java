@@ -67,8 +67,8 @@ public class EvalDatasetController {
         String referenceAnswer = (String) params.get("referenceAnswer");
         String groundTruthChunkIds = (String) params.get("groundTruthChunkIds");
 
-        if (documentId == null || question == null || question.isBlank()) {
-            return ResponseEntity.badRequest().body(Map.of("error", "documentId 和 question 不能为空"));
+        if (question == null || question.isBlank()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "question 不能为空"));
         }
 
         EvalDataset dataset;
@@ -77,9 +77,13 @@ public class EvalDatasetController {
             if (dataset == null) {
                 return ResponseEntity.badRequest().body(Map.of("error", "条目不存在"));
             }
+            // 编辑时只更新已存在的字段，null 表示不修改
+            if (params.containsKey("documentId")) {
+                dataset.setDocumentId(documentId);
+            }
         } else {
             dataset = new EvalDataset();
-            dataset.setDocumentId(documentId);
+            dataset.setDocumentId(documentId);  // 可为 null
             dataset.setSource("manual");
             dataset.setDifficulty("medium");
             dataset.setIsActive(1);

@@ -4,8 +4,12 @@ import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.javaup.ai.chatagent.rag.model.ConversationExecutionPlan;
+import org.javaup.ai.chatagent.rag.model.DocumentNavigationDecision;
+import org.javaup.ai.chatagent.rag.model.RagRewriteResult;
 import org.javaup.ai.chatagent.rag.model.RagRetrievalContext;
 import org.javaup.ai.chatagent.rag.model.SubQuestionEvidence;
+import org.javaup.ai.chatagent.rag.service.ChatQueryRewriteService;
+import org.javaup.ai.chatagent.rag.service.DocumentQuestionRouter;
 import org.javaup.ai.chatagent.rag.service.RagRetrievalEngine;
 import org.javaup.ai.manage.data.SuperAgentDocument;
 import org.javaup.ai.manage.mapper.SuperAgentDocumentMapper;
@@ -37,6 +41,8 @@ public class EvalApiController {
 
     private final RagRetrievalEngine ragRetrievalEngine;
     private final SuperAgentDocumentMapper documentMapper;
+    private final ChatQueryRewriteService chatQueryRewriteService;
+    private final DocumentQuestionRouter documentQuestionRouter;
 
     /**
      * 纯检索接口（供 eval 服务调用）
@@ -51,37 +57,64 @@ public class EvalApiController {
         }
 
         long startTime = System.currentTimeMillis();
+        String originalQuestion = request.getQuestion().trim();
 
-        // 1. 查询文档的最新索引任务 ID（vector 和 keyword 检索都需要 taskId 过滤）
+        // 1. 查询文档的最新索引任务 ID
         Long taskId = null;
         SuperAgentDocument doc = documentMapper.selectById(request.getDocumentId());
         if (doc != null && doc.getLastIndexTaskId() != null) {
             taskId = doc.getLastIndexTaskId();
-            log.debug("查询到文档 lastIndexTaskId: documentId={}, taskId={}", request.getDocumentId(), taskId);
         } else {
             log.warn("文档 {} 未找到或无 lastIndexTaskId，检索可能返回空", request.getDocumentId());
         }
 
-        // 2. 构造最小化的 ConversationExecutionPlan
-        //     关键：必须填充 selectedDocumentId + selectedTaskId，否则检索 SQL 的 task_id IN (...) 条件不匹配
+        // 2. ⭐ 问题改写：将口语化问题改写为检索友好的结构化查询（和聊天链路一致）
+        log.info("内部检索改写: question='{}'", originalQuestion);
+        RagRewriteResult rewriteResult = chatQueryRewriteService.rewrite(originalQuestion, "");
+        String rewriteQuestion = rewriteResult == null ? originalQuestion : rewriteResult.getRewrittenQuestion();
+        List<String> subQuestions = rewriteResult == null || rewriteResult.getSubQuestions() == null || rewriteResult.getSubQuestions().isEmpty()
+            ? List.of(rewriteQuestion)
+            : rewriteResult.getSubQuestions();
+        log.info("内部检索改写完成: original='{}', rewritten='{}', subQuestions={}",
+            originalQuestion, rewriteQuestion, subQuestions);
+
+        // 3. ⭐ 文档路由决策：判断走图查询还是检索，获取章节锚点和检索增强信息
+        DocumentNavigationDecision navDecision = documentQuestionRouter.route(request.getDocumentId(), originalQuestion, rewriteResult);
+        String retrievalQuestion = rewriteQuestion;
+        List<String> retrievalSubQuestions = subQuestions;
+        if (navDecision != null && navDecision.getRetrievalPlan() != null) {
+            retrievalQuestion = navDecision.getRetrievalPlan().getRetrievalQuestion();
+            retrievalSubQuestions = navDecision.getRetrievalPlan().getSubQuestions();
+        }
+        log.info("内部检索路由完成: mode={}, question='{}'",
+            navDecision == null || navDecision.getExecutionMode() == null ? "NONE" : navDecision.getExecutionMode(),
+            retrievalQuestion);
+
+        // 4. 构造完整的 ConversationExecutionPlan（和聊天链路的 prepare 阶段产出一致）
         ConversationExecutionPlan plan = ConversationExecutionPlan.builder()
-            .originalQuestion(request.getQuestion())
-            .retrievalQuestion(request.getQuestion())
+            .originalQuestion(originalQuestion)
+            .rewriteQuestion(rewriteQuestion)
+            .rewriteSubQuestions(subQuestions)
+            .retrievalQuestion(retrievalQuestion)
+            .retrievalSubQuestions(retrievalSubQuestions)
             .selectedDocumentId(request.getDocumentId())
             .selectedTaskId(taskId)
             .retrievalDocumentIds(taskId != null ? List.of(request.getDocumentId()) : List.of())
             .retrievalTaskIds(taskId != null ? List.of(taskId) : List.of())
+            .navigationDecision(navDecision)
             .build();
 
-        // 3. 调用检索引擎（不传 traceRecorder，避免产生数据库追踪记录）
+        // 5. 调用检索引擎（带完整的改写+路由信息）
         RagRetrievalContext context = ragRetrievalEngine.retrieve(plan, null);
 
-        // 3. 转换为扁平化的 RPC 响应
+        // 6. 转换为 RPC 响应
         Map<String, Object> response = buildRpcResponse(context);
 
         long latency = System.currentTimeMillis() - startTime;
-        log.debug("内部检索完成: documentId={}, question='{}', latency={}ms",
-            request.getDocumentId(), truncate(request.getQuestion(), 50), latency);
+        log.info("内部检索完成: documentId={}, question='{}', rewritten='{}', mode={}, notes={}, latency={}ms",
+            request.getDocumentId(), originalQuestion, rewriteQuestion,
+            navDecision == null || navDecision.getExecutionMode() == null ? "NONE" : navDecision.getExecutionMode(),
+            context.getRetrievalNotes(), latency);
         response.put("_latencyMs", latency);
 
         return response;

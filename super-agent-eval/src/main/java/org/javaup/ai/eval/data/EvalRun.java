@@ -54,6 +54,9 @@ public class EvalRun extends BaseEvalEntity {
     /** 平均 Answer Relevancy */
     private BigDecimal avgAnswerRelevancy;
 
+    /** 平均 Answer Accuracy — 所有测试题的平均答案准确率 */
+    private BigDecimal avgAnswerAccuracy;
+
     /** 平均检索耗时（毫秒） */
     private Long avgLatencyMs;
 

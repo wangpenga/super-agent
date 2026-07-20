@@ -75,18 +75,36 @@ public class RagasRelevanceJudge {
     }
 
     /**
-     * 批量判断相关性（带 rerank 分层）
+     * 批量判断相关性（带 rerank 分层 + 参考答案辅助）
+     * <p>
+     * 与旧版本相比，新增 referenceAnswer 参数。传给 LLM Judge 作为辅助上下文，
+     * 让 Judge 知道"需要什么信息"，从而判断文档相关性时更精准。
+     * <p>
+     * 判断标准变为："这篇文档是否对综合推理出标准答案有帮助？"
+     * 而不是旧的"这篇文档里是否直接包含了答案？"
      *
-     * @param question    用户问题
-     * @param documents   检索结果文档列表（按排序传入）
+     * @param question        用户问题
+     * @param referenceAnswer 参考答案（标准答案），辅助 LLM Judge 判断相关性
+     * @param documents       检索结果文档列表（按排序传入）
      * @return 相关性判断列表，与输入文档列表一一对应
      */
     public List<ContextPrecisionResult.RelevanceJudgment> judgeBatch(
             String question,
+            String referenceAnswer,
             List<RetrievalRpcResult.DocumentResult> documents) {
 
         if (documents == null || documents.isEmpty()) {
             return List.of();
+        }
+
+        String judgeContext;
+        if (referenceAnswer != null && !referenceAnswer.isBlank()) {
+            judgeContext = "问题：" + question + "\n参考答案（标准答案）：" + referenceAnswer
+                + "\n\n判断标准：这篇文档是否包含对综合推理出参考答案有帮助的信息？"
+                + "即使文档不包含完整答案，只要包含部分关键事实、数据或推理依据，就判为相关。";
+        } else {
+            judgeContext = "问题：" + question
+                + "\n\n判断标准：这篇文档是否包含回答该问题所需的相关信息？";
         }
 
         List<ContextPrecisionResult.RelevanceJudgment> judgments = new ArrayList<>(documents.size());
@@ -97,13 +115,11 @@ public class RagasRelevanceJudge {
             Double rerankScore = doc.getRerankScore();
 
             if (rerankScore != null && rerankScore >= rerankThresholdHigh) {
-                // rerank 分高 → 直接相关（零 LLM）
                 judgments.add(new ContextPrecisionResult.RelevanceJudgment(
                     doc.getChunkId(), i + 1, true, "rerank", rerankScore,
                     "rerank_score=" + String.format("%.4f", rerankScore) + " ≥ " + rerankThresholdHigh,
                     truncate(doc.getText(), 100)));
             } else if (rerankScore != null && rerankScore < rerankThresholdLow) {
-                // rerank 分低 → 直接不相关（零 LLM）
                 judgments.add(new ContextPrecisionResult.RelevanceJudgment(
                     doc.getChunkId(), i + 1, false, "rerank", rerankScore,
                     "rerank_score=" + String.format("%.4f", rerankScore) + " < " + rerankThresholdLow,
@@ -123,18 +139,18 @@ public class RagasRelevanceJudge {
         }
 
         if (!llmIndices.isEmpty()) {
-            log.info("LLM Judge 处理 {} 个争议文档 (rerank 分在 {}-{} 区间)",
-                llmIndices.size(), rerankThresholdLow, rerankThresholdHigh);
+            log.info("LLM Judge 处理 {} 个争议文档 (rerank 分在 {}-{} 区间，referenceAnswer={})",
+                llmIndices.size(), rerankThresholdLow, rerankThresholdHigh,
+                referenceAnswer != null && !referenceAnswer.isBlank());
 
             List<CompletableFuture<Void>> futures = llmIndices.stream()
                 .map(idx -> CompletableFuture.runAsync(() -> {
                     RetrievalRpcResult.DocumentResult doc = documents.get(idx);
-                    ContextPrecisionResult.RelevanceJudgment judgeResult = llmJudge(question, doc, idx + 1);
+                    ContextPrecisionResult.RelevanceJudgment judgeResult = llmJudge(question, judgeContext, doc, idx + 1);
                     judgments.set(idx, judgeResult);
                 }, judgeExecutor))
                 .toList();
 
-            // 等待所有 LLM Judge 完成
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
         }
 
@@ -142,14 +158,36 @@ public class RagasRelevanceJudge {
     }
 
     /**
-     * 调用 LLM 判断单条文档相关性
+     * 批量判断相关性（旧版本，无参考答案）
+     * 内部委托给新版本，传 referenceAnswer=null
+     */
+    public List<ContextPrecisionResult.RelevanceJudgment> judgeBatch(
+            String question,
+            List<RetrievalRpcResult.DocumentResult> documents) {
+        return judgeBatch(question, null, documents);
+    }
+
+    /**
+     * 调用 LLM 判断单条文档相关性（带参考答案上下文）
      */
     private ContextPrecisionResult.RelevanceJudgment llmJudge(
-            String question, RetrievalRpcResult.DocumentResult doc, int rank) {
+            String question, String judgeContext,
+            RetrievalRpcResult.DocumentResult doc, int rank) {
 
         try {
-            String userPrompt = JUDGE_USER_PROMPT_TEMPLATE
-                .replace("{question}", question)
+            String userPrompt = """
+                判断以下文档片段是否包含回答该问题所需的相关信息。
+
+                {judge_context}
+
+                文档片段：{chunk_text}
+
+                只输出以下 JSON：
+                {"relevant": true, "reason": "说明为什么这篇文档对回答问题有帮助"}
+                或
+                {"relevant": false, "reason": "说明为什么不相关"}
+                """
+                .replace("{judge_context}", judgeContext)
                 .replace("{chunk_text}", doc.getText() != null ? doc.getText() : "");
 
             Prompt prompt = new Prompt(List.of(
@@ -158,7 +196,7 @@ public class RagasRelevanceJudge {
             ));
 
             String response = chatModel.call(prompt).getResult().getOutput().getText();
-            JSONObject json = JSONUtil.parseObj(extractJson(response));
+            JSONObject json = JSONUtil.parseObj(extractJsonObject(response));
 
             boolean relevant = json.getBool("relevant", false);
             String reason = json.getStr("reason", "");
@@ -225,7 +263,7 @@ public class RagasRelevanceJudge {
                 new UserMessage(prompt)
             ))).getResult().getOutput().getText();
 
-            JSONArray arr = JSONUtil.parseArray(extractJson(response));
+            JSONArray arr = JSONUtil.parseArray(extractJsonArray(response));
             List<String> claims = new ArrayList<>();
             for (int i = 0; i < arr.size(); i++) {
                 String claim = arr.getStr(i);
@@ -268,7 +306,7 @@ public class RagasRelevanceJudge {
                 new UserMessage(prompt)
             ))).getResult().getOutput().getText();
 
-            JSONObject json = JSONUtil.parseObj(extractJson(response));
+            JSONObject json = JSONUtil.parseObj(extractJsonObject(response));
             return json.getBool("faithful", false);
         } catch (Exception e) {
             log.warn("Faithfulness 判断失败，默认不忠实: claim='{}'", truncate(claim, 50), e);
@@ -331,7 +369,7 @@ public class RagasRelevanceJudge {
                 new UserMessage(prompt)
             ))).getResult().getOutput().getText();
 
-            JSONArray arr = JSONUtil.parseArray(extractJson(response));
+            JSONArray arr = JSONUtil.parseArray(extractJsonArray(response));
             List<String> questions = new ArrayList<>();
             for (int i = 0; i < arr.size(); i++) {
                 questions.add(arr.getStr(i));
@@ -359,12 +397,11 @@ public class RagasRelevanceJudge {
     }
 
     /**
-     * 从 LLM 响应中提取 JSON（处理可能的 markdown 包裹）
+     * 从 LLM 响应中提取 JSON 数组
      */
-    private String extractJson(String text) {
-        if (text == null) return "{}";
+    private String extractJsonArray(String text) {
+        if (text == null) return "[]";
         text = text.trim();
-        // 去掉 ```json 和 ``` 包裹
         if (text.startsWith("```")) {
             int start = text.indexOf('\n');
             int end = text.lastIndexOf("```");
@@ -372,11 +409,35 @@ public class RagasRelevanceJudge {
                 text = text.substring(start, end).trim();
             }
         }
-        // 找到第一个 { 和最后一个 }
+        int start = text.indexOf('[');
+        if (start >= 0) {
+            int end = text.lastIndexOf(']');
+            if (end > start) {
+                return text.substring(start, end + 1);
+            }
+        }
+        return "[]";
+    }
+
+    /**
+     * 从 LLM 响应中提取 JSON 对象
+     */
+    private String extractJsonObject(String text) {
+        if (text == null) return "{}";
+        text = text.trim();
+        if (text.startsWith("```")) {
+            int start = text.indexOf('\n');
+            int end = text.lastIndexOf("```");
+            if (start > 0 && end > start) {
+                text = text.substring(start, end).trim();
+            }
+        }
         int start = text.indexOf('{');
-        int end = text.lastIndexOf('}');
-        if (start >= 0 && end > start) {
-            return text.substring(start, end + 1);
+        if (start >= 0) {
+            int end = text.lastIndexOf('}');
+            if (end > start) {
+                return text.substring(start, end + 1);
+            }
         }
         return "{}";
     }

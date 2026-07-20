@@ -53,6 +53,9 @@ public class EvalQuestionResult extends BaseEvalEntity {
     /** Answer Relevancy 分数（0~1） */
     private BigDecimal answerRelevancy;
 
+    /** Answer Accuracy 分数（0~1）— 生成答案与参考答案是否意思一致 */
+    private BigDecimal answerAccuracy;
+
     /** 检索阶段耗时（毫秒） */
     private Long retrievalLatencyMs;
 

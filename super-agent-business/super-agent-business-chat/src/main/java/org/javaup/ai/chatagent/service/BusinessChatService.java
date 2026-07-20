@@ -43,6 +43,7 @@ import org.javaup.lease.RedisLeaseManager;
 import org.springframework.ai.chat.messages.AbstractMessage;
 import org.springframework.ai.chat.messages.MessageType;
 import org.springframework.stereotype.Service;
+import org.springframework.web.reactive.function.client.WebClientRequestException;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
@@ -50,6 +51,7 @@ import reactor.core.publisher.Mono;
 import reactor.core.publisher.Sinks;
 import reactor.core.scheduler.Schedulers;
 
+import java.net.URI;
 import java.time.DayOfWeek;
 import java.time.Duration;
 import java.time.Instant;
@@ -1100,12 +1102,19 @@ private void failBootstrappedExchange(String conversationId, long exchangeId, St
      *   <li>不生成推荐追问</li>
      *   <li>发送 error SSE 事件（而不是 references/recommendations）</li>
      *   <li>DB 状态标记为 FAILED，保存 errorMessage</li>
-     *   <li>追溯异常链：如果是 WebClientResponseException，提取 HTTP 状态码和响应体</li>
+     *   <li>追溯异常链：
+     *       <ul>
+     *         <li>WebClientResponseException → 提取 HTTP 状态码和响应体</li>
+     *         <li>WebClientRequestException → 根据连接异常类型返回中文可读信息</li>
+     *       </ul>
+     *   </li>
      * </ul>
      * <p>
      * <b>错误信息提取逻辑</b>（buildErrorMessage）：
-     * 沿异常链向上查找 WebClientResponseException（下游 HTTP 调用失败的异常），
-     * 找到则返回 "状态码 from 方法 URL | responseBody=..." 的详细错误信息，
+     * 沿异常链向上查找 WebClientResponseException（HTTP 4xx/5xx 错误响应），
+     * 找到则返回 "状态码 from 方法 URL | responseBody=..." 的详细错误信息；
+     * 如果找到 WebClientRequestException（连接层面错误：连接被拒、超时、DNS 失败等），
+     * 则根据底层异常类型返回用户可读的中文错误信息；
      * 否则返回最外层异常的 message。
      *
      * @param taskInfo 运行时任务上下文
@@ -1186,7 +1195,8 @@ private void failBootstrappedExchange(String conversationId, long exchangeId, St
 
         Throwable current = error;
         while (current != null) {
-
+            // ═══ 分支 A：HTTP 响应错误（4xx/5xx）═══
+            // WebClientResponseException 带响应体和状态码，提取关键信息返回
             if (current instanceof WebClientResponseException responseException) {
                 String responseBody = responseException.getResponseBodyAsString();
                 if (StrUtil.isNotBlank(responseBody)) {
@@ -1201,9 +1211,41 @@ private void failBootstrappedExchange(String conversationId, long exchangeId, St
 
                 return responseException.getMessage();
             }
+
+            // ═══ 分支 B：连接层面错误（连接被拒、超时、DNS 解析失败等）═══
+            // WebClientRequestException 是 WebClientResponseException 的父类，
+            // 必须放在 WebClientResponseException 之后检查，确保更具体的类型优先匹配。
+            if (current instanceof WebClientRequestException requestException) {
+                URI uri = requestException.getUri();
+                Throwable cause = requestException.getCause();
+                String target = uri != null ? uri.toString() : "未知端点";
+
+                // 根据底层连接异常类型返回可读的中文错误信息
+                if (cause != null) {
+                    String causeName = cause.getClass().getSimpleName();
+                    return switch (causeName) {
+                        case "ConnectException" ->
+                            "无法连接到 AI 服务（" + target + "），请检查网络连接和 API 服务状态。";
+                        case "SocketTimeoutException", "TimeoutException" ->
+                            "AI 服务连接超时（" + target + "），请稍后重试。";
+                        case "UnknownHostException" ->
+                            "无法解析 AI 服务地址（" + target + "），请检查 DNS 配置。";
+                        case "SSLHandshakeException", "SSLException" ->
+                            "AI 服务 SSL 连接错误（" + target + "），请检查证书配置。";
+                        case "ConnectionPoolTimeoutException" ->
+                            "AI 服务连接池已满（" + target + "），请稍后重试。";
+                        default ->
+                            "AI 服务调用失败（" + target + "）：" + cause.getMessage();
+                    };
+                }
+
+                return "AI 服务调用失败（" + target + "），请检查网络连接。";
+            }
+
             current = current.getCause();
         }
 
+        // ═══ 兜底：无法匹配任何已知异常类型，返回原始异常信息 ═══
         return error.getMessage() != null ? error.getMessage() : error.getClass().getSimpleName();
     }
 

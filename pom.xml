@@ -34,11 +34,11 @@
         <jaxb.api.version>2.3.1</jaxb.api.version>
         <jaxb.runtime.version>2.3.9</jaxb.runtime.version>
         <hutool.version>5.8.25</hutool.version>
-        <lombok.version>1.18.20</lombok.version>
+        <lombok.version>1.18.36</lombok.version>
         <mybatis-plus.version>3.5.7</mybatis-plus.version>
         <fastjson.version>1.2.83</fastjson.version>
         <hutool.version>5.8.25</hutool.version>
-        <maven-compiler.version>3.8.1</maven-compiler.version>
+        <maven-compiler.version>3.13.0</maven-compiler.version>
         <maven-resources.version>3.2.0</maven-resources.version>
         <maven-source.version>3.2.1</maven-source.version>
         <flatten-maven.version>1.4.1</flatten-maven.version>
@@ -84,7 +84,6 @@
                     <encoding>${project.build.sourceEncoding}</encoding>
                     <source>${java.version}</source>
                     <target>${java.version}</target>
-                    <encoding>${project.build.sourceEncoding}</encoding>
                 </configuration>
             </plugin>
             <plugin>

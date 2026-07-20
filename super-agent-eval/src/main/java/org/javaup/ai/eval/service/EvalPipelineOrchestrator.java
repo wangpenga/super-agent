@@ -10,11 +10,18 @@ import org.javaup.ai.eval.data.EvalQuestionResult;
 import org.javaup.ai.eval.data.EvalRun;
 import org.javaup.ai.eval.mapper.EvalQuestionResultMapper;
 import org.javaup.ai.eval.mapper.EvalRunMapper;
+import org.javaup.ai.eval.metric.AnswerAccuracyResult;
+import org.javaup.ai.eval.metric.AnswerRelevancyResult;
 import org.javaup.ai.eval.metric.ContextPrecisionResult;
 import org.javaup.ai.eval.metric.ContextRecallResult;
+import org.javaup.ai.eval.metric.FaithfulnessResult;
 import org.javaup.ai.eval.metric.RagasMetricCalculator;
 import org.javaup.ai.eval.remote.RetrievalRpcResult;
 import org.javaup.ai.eval.remote.impl.RagRetrievalRestClient;
+import org.springframework.ai.chat.messages.SystemMessage;
+import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.ai.chat.model.ChatModel;
+import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.stereotype.Service;
 
@@ -61,6 +68,7 @@ public class EvalPipelineOrchestrator {
     private final EvalQuestionResultMapper questionResultMapper;
     private final EvalProperties evalProperties;
     private final EmbeddingModel embeddingModel;
+    private final ChatModel chatModel;
 
     // 并发评估线程池
     private final ExecutorService evalExecutor = Executors.newFixedThreadPool(8);
@@ -140,12 +148,13 @@ public class EvalPipelineOrchestrator {
             evalRunMapper.updateById(evalRun);
 
             log.info("========================================");
-            log.info("评估运行完成: runName={}, avgPrecision={}, avgRecall={}, avgFaithfulness={}, avgRelevancy={}",
+            log.info("评估运行完成: runName={}, avgPrecision={}, avgRecall={}, avgFaithfulness={}, avgRelevancy={}, avgAccuracy={}",
                 runName,
                 evalRun.getAvgContextPrecision(),
                 evalRun.getAvgContextRecall(),
                 evalRun.getAvgFaithfulness(),
-                evalRun.getAvgAnswerRelevancy());
+                evalRun.getAvgAnswerRelevancy(),
+                evalRun.getAvgAnswerAccuracy());
             log.info("========================================");
 
         } catch (Exception e) {
@@ -180,6 +189,10 @@ public class EvalPipelineOrchestrator {
 
     /**
      * 评估单条测试数据
+     * <p>
+     * 用户只需提供 question + referenceAnswer，不需要知道文档ID。
+     * 有 documentId → 算全部指标（Precision/Recall/Faithfulness）
+     * 无 documentId → 只算 Accuracy 和 AnswerRelevancy
      */
     private EvalQuestionResult evaluateSingleItem(Long runId, EvalDataset dataset) {
         if (!running) {
@@ -195,80 +208,106 @@ public class EvalPipelineOrchestrator {
         result.setQuestion(dataset.getQuestion());
 
         try {
-            // a. 调用主服务检索
-            RetrievalRpcResult retrievalResult = retrievalClient.retrieve(
-                dataset.getDocumentId(), dataset.getQuestion());
+            Long docId = dataset.getDocumentId();
+            String referenceAnswer = dataset.getReferenceAnswer();
+
+            // ────────── Step 1: 调聊天接口获取生成答案 + 检索证据 ──────────
+            // 从 SSE 的 text 事件拿答案，从 references 事件拿检索证据
+            // 有 docId → DOCUMENT 模式，无 → AUTO_DOCUMENT 模式
+            var chatResult = retrievalClient.chatAnswerWithEvidence(docId, dataset.getQuestion());
+            String generatedAnswer = chatResult.getAnswer();
+            String evidenceText = chatResult.buildEvidenceText();
+            result.setAnswer(generatedAnswer != null ? generatedAnswer : "");
 
             long latency = System.currentTimeMillis() - startTime;
             result.setRetrievalLatencyMs(latency);
 
-            List<RetrievalRpcResult.DocumentResult> allDocs = retrievalResult.flattenDocuments();
+            if (result.getAnswer().isBlank()) {
+                log.warn("datasetId={} 聊天接口未返回有效回答", dataset.getId());
+            }
 
-            // 记录检索到的 chunk IDs
-            List<Long> retrievedChunkIds = allDocs.stream()
-                .map(RetrievalRpcResult.DocumentResult::getChunkId)
-                .filter(Objects::nonNull)
-                .toList();
-            result.setRetrievedChunkIds(JSONUtil.toJsonStr(retrievedChunkIds));
-            result.setFinalTopK(allDocs.size());
+            // 检测是否为澄清响应（AUTO_DOCUMENT 置信度不足时返回）
+            // 如果是澄清，跳过所有指标计算
+            boolean isClarification = !chatResult.hasEvidence()
+                && (generatedAnswer.contains("文档范围歧义")
+                    || generatedAnswer.contains("候选文档")
+                    || generatedAnswer.contains("避免误选"));
 
-            log.debug("评估中: datasetId={}, docs={}, latency={}ms",
-                dataset.getId(), allDocs.size(), latency);
+            if (isClarification) {
+                log.info("datasetId={} AUTO_DOCUMENT 返回澄清而非答案，跳过指标计算", dataset.getId());
+            }
 
-            // b. 计算 Context Precision
-            ContextPrecisionResult precision = metricCalculator.computeContextPrecision(
-                dataset.getQuestion(), allDocs);
-            result.setContextPrecision(BigDecimal.valueOf(precision.getScore())
-                .setScale(6, RoundingMode.HALF_UP));
+            // ────────── Step 2: Precision/Recall/Faithfulness（从 SSE reference 取证）──────────
+            // 从 chat SSE 的 reference 事件拿证据，有 docId 时一定会有
+            if (!isClarification && chatResult.hasEvidence()) {
+                ContextPrecisionResult precision = metricCalculator.computeContextPrecision(
+                    dataset.getQuestion(), referenceAnswer, convertEvidenceChunks(chatResult.getEvidenceChunks()));
+                result.setContextPrecision(toBigDecimal(precision.getScore()));
+            }
 
-            // 保存相关性判断明细
-            List<Map<String, Object>> judgmentDetails = precision.getJudgments().stream()
-                .map(j -> {
-                    Map<String, Object> m = new LinkedHashMap<>();
-                    m.put("chunkId", j.getChunkId());
-                    m.put("rank", j.getRank());
-                    m.put("relevant", j.isRelevant());
-                    m.put("method", j.getMethod());
-                    m.put("rerankScore", j.getRerankScore());
-                    m.put("reason", j.getReason());
-                    return m;
-                })
-                .toList();
-            result.setRelevanceJudgments(JSONUtil.toJsonStr(judgmentDetails));
+            if (referenceAnswer != null && !referenceAnswer.isBlank()
+                && evidenceText != null && !evidenceText.isBlank()) {
+                ContextRecallResult recall = metricCalculator.computeContextRecall(
+                    dataset.getQuestion(), referenceAnswer, evidenceText);
+                result.setContextRecall(toBigDecimal(recall.getScore()));
+            }
 
-            // c. 计算 Context Recall
-            ContextRecallResult recall = metricCalculator.computeContextRecall(
-                dataset.getGroundTruthChunkIds(), allDocs);
-            result.setContextRecall(BigDecimal.valueOf(recall.getScore())
-                .setScale(6, RoundingMode.HALF_UP));
-
-            // d. 如果有答案（来自对话日志的数据集），评估 Faithfulness + Answer Relevancy
-            if (dataset.getSource() != null && dataset.getSource().contains("conversation")) {
-                // 注意：答案文本需要在创建数据集时一并保存
-                // 此处只预留扩展点，实际使用时需要从对话日志获取完整答案
-                String evidenceText = metricCalculator.buildEvidenceText(allDocs);
-                if (evidenceText != null && !evidenceText.isBlank()) {
-                    // Faithfulness: 需要答案文本，从 dataset 的扩展字段或关联查询获取
-                    // 先留空，后续可通过 exchangeId 关联查询
-                    if (dataset.getExchangeId() != null) {
-                        // TODO: 通过 exchangeId 查询对话日志获取完整答案
-                        log.debug("datasetId={} 有 exchangeId={}，可补充 Faithfulness 评估",
-                            dataset.getId(), dataset.getExchangeId());
-                    }
+            if (generatedAnswer != null && !generatedAnswer.isBlank()
+                && evidenceText != null && !evidenceText.isBlank()) {
+                FaithfulnessResult faithfulness = metricCalculator.computeFaithfulness(
+                    generatedAnswer, evidenceText);
+                result.setFaithfulness(toBigDecimal(faithfulness.getScore()));
+            }
+            // ────────── Step 3: Answer Relevancy（非澄清时才有效）──────────
+            AnswerRelevancyResult relevancy = AnswerRelevancyResult.ZERO;
+            if (!isClarification && generatedAnswer != null && !generatedAnswer.isBlank()) {
+                try {
+                    relevancy = metricCalculator.computeAnswerRelevancy(
+                        dataset.getQuestion(), generatedAnswer, embeddingModel::embed);
+                } catch (Exception e) {
+                    log.warn("AnswerRelevancy 计算失败: datasetId={}", dataset.getId(), e);
                 }
             }
+            result.setAnswerRelevancy(toBigDecimal(relevancy.getScore()));
+
+            // ────────── Step 4: Answer Accuracy（非澄清时才有效）──────────
+            AnswerAccuracyResult accuracy = AnswerAccuracyResult.ZERO;
+            if (!isClarification && generatedAnswer != null && !generatedAnswer.isBlank()
+                && referenceAnswer != null && !referenceAnswer.isBlank()) {
+                try {
+                    accuracy = metricCalculator.computeAnswerAccuracy(
+                        dataset.getQuestion(), generatedAnswer, referenceAnswer);
+                } catch (Exception e) {
+                    log.warn("AnswerAccuracy 计算失败: datasetId={}", dataset.getId(), e);
+                }
+            }
+            result.setAnswerAccuracy(toBigDecimal(accuracy.getScore()));
 
         } catch (Exception e) {
             log.error("单条评估失败: datasetId={}, question='{}'",
                 dataset.getId(), truncate(dataset.getQuestion(), 50), e);
-            result.setContextPrecision(BigDecimal.ZERO);
-            result.setContextRecall(BigDecimal.ZERO);
         }
 
         // 持久化
         result.setStatus(1);
         questionResultMapper.insert(result);
         return result;
+    }
+
+    private List<RetrievalRpcResult.DocumentResult> convertEvidenceChunks(List<String> chunks) {
+        if (chunks == null || chunks.isEmpty()) return List.of();
+        List<RetrievalRpcResult.DocumentResult> docs = new ArrayList<>();
+        for (int i = 0; i < chunks.size(); i++) {
+            RetrievalRpcResult.DocumentResult doc = new RetrievalRpcResult.DocumentResult();
+            doc.setId(String.valueOf(i + 1));
+            doc.setText(chunks.get(i));
+            docs.add(doc);
+        }
+        return docs;
+    }
+
+    private BigDecimal toBigDecimal(double value) {
+        return BigDecimal.valueOf(value).setScale(6, RoundingMode.HALF_UP);
     }
 
     // ──────────────────────────────────────────────
@@ -297,6 +336,10 @@ public class EvalPipelineOrchestrator {
             .filter(r -> r.getAnswerRelevancy() != null)
             .collect(Collectors.summarizingDouble(r -> r.getAnswerRelevancy().doubleValue()));
 
+        DoubleSummaryStatistics accuracyStats = results.stream()
+            .filter(r -> r.getAnswerAccuracy() != null)
+            .collect(Collectors.summarizingDouble(r -> r.getAnswerAccuracy().doubleValue()));
+
         DoubleSummaryStatistics latencyStats = results.stream()
             .filter(r -> r.getRetrievalLatencyMs() != null)
             .collect(Collectors.summarizingDouble(r -> r.getRetrievalLatencyMs()));
@@ -309,6 +352,8 @@ public class EvalPipelineOrchestrator {
             BigDecimal.valueOf(faithfulnessStats.getAverage()).setScale(6, RoundingMode.HALF_UP));
         evalRun.setAvgAnswerRelevancy(
             BigDecimal.valueOf(relevancyStats.getAverage()).setScale(6, RoundingMode.HALF_UP));
+        evalRun.setAvgAnswerAccuracy(
+            BigDecimal.valueOf(accuracyStats.getAverage()).setScale(6, RoundingMode.HALF_UP));
         evalRun.setAvgLatencyMs((long) latencyStats.getAverage());
     }
 

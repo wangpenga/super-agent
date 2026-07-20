@@ -30,8 +30,8 @@
       <h4>{{ isAdding ? '新增测试条目' : '编辑测试条目' }}</h4>
       <div class="edit-grid">
         <div class="edit-field">
-          <label>文档 ID <span class="req">*</span></label>
-          <input v-model="form.documentId" type="number" class="input-full" placeholder="必填" />
+          <label>文档 ID</label>
+          <input v-model="form.documentId" type="number" class="input-full" placeholder="选填（不指定时仅算 Answer Accuracy）" />
         </div>
         <div class="edit-field">
           <label>难度</label>
@@ -245,8 +245,8 @@ function cancelEdit() {
 
 async function saveEdit() {
   const f = form.value
-  if (!f.documentId || !f.question?.trim()) {
-    formError.value = '文档 ID 和问题不能为空'
+  if (!f.question?.trim()) {
+    formError.value = '问题不能为空'
     return
   }
   saving.value = true
@@ -254,7 +254,7 @@ async function saveEdit() {
   try {
     await evalApi.saveDataset({
       id: f.id || undefined,
-      documentId: Number(f.documentId),
+      documentId: f.documentId ? Number(f.documentId) : undefined,
       question: f.question.trim(),
       referenceAnswer: f.referenceAnswer || undefined,
       difficulty: f.difficulty,
